@@ -340,3 +340,51 @@ def systems_to_batch(
         nef_to_edges_neighbor,
         cell_shifts,
     )
+
+
+def get_atom_pair_edges(
+    systems: List[System],
+    options: NeighborListOptions,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Lightweight extraction of flat per-edge geometry for atom-pair targets.
+
+    Unlike :func:`systems_to_batch`, this does not build the NEF representation
+    and does not apply adaptive cutoffs; it only returns the flat edge arrays
+    needed to build node-derived edge features. It is meant to be used with a
+    (typically larger) neighbor list that is separate from the one driving the
+    GNN.
+
+    :param systems: List of systems to process.
+    :param options: Options for the (atom-pair) neighbor list.
+    :return: A tuple ``(centers, neighbors, edge_vectors, edge_distances)`` where
+        ``centers`` and ``neighbors`` are global atom indices of shape
+        ``(n_edges,)``, ``edge_vectors`` has shape ``(n_edges, 3)`` and
+        ``edge_distances`` has shape ``(n_edges,)``.
+    """
+    (
+        positions,
+        centers,
+        neighbors,
+        species,
+        cells,
+        cell_shifts,
+        system_indices,
+        sample_labels,
+    ) = concatenate_structures(systems, options)
+
+    # somehow the backward of this operation is very slow at evaluation,
+    # where there is only one cell, therefore we simplify the calculation
+    # for that case
+    if len(cells) == 1:
+        cell_contributions = cell_shifts.to(cells.dtype) @ cells[0]
+    else:
+        cell_contributions = torch.einsum(
+            "ab, abc -> ac",
+            cell_shifts.to(cells.dtype),
+            cells[system_indices[centers]],
+        )
+    edge_vectors = positions[neighbors] - positions[centers] + cell_contributions
+    edge_distances = torch.norm(edge_vectors, dim=-1) + 1e-15
+
+    return centers, neighbors, edge_vectors, edge_distances

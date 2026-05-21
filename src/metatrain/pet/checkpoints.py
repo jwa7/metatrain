@@ -290,6 +290,20 @@ def model_update_v12_v13(checkpoint: dict) -> None:
     update_per_property_scales(checkpoint)
 
 
+def model_update_v13_v14(checkpoint: dict) -> None:
+    """
+    Update a v13 checkpoint to v14.
+
+    Adds the ``edge_features_from_nodes`` and ``cutoff_edge_features`` model
+    hyperparameters, defaulting to the pre-existing behaviour (disabled).
+
+    :param checkpoint: The checkpoint to update.
+    """
+    model_hypers = checkpoint["model_data"]["model_hypers"]
+    model_hypers["edge_features_from_nodes"] = False
+    model_hypers["cutoff_edge_features"] = None
+
+
 ###########################
 # TRAINER #################
 ###########################

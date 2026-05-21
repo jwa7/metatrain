@@ -34,8 +34,9 @@ from metatrain.utils.sum_over_atoms import sum_over_atoms
 
 from . import checkpoints
 from .documentation import ModelHypers
+from .modules.edge_featurizer import DummyEdgeFeaturizer, EdgeFeaturizerFromNodes
 from .modules.finetuning import apply_finetuning_strategy
-from .modules.structures import systems_to_batch
+from .modules.structures import get_atom_pair_edges, systems_to_batch
 from .modules.transformer import CartesianTransformer
 
 
@@ -54,7 +55,7 @@ class PET(ModelInterface[ModelHypers]):
         targets.
     """
 
-    __checkpoint_version__ = 13
+    __checkpoint_version__ = 14
     __supported_devices__ = ["cuda", "cpu"]
     __supported_dtypes__ = [torch.float32, torch.float64]
     __default_metadata__ = ModelMetadata(
@@ -90,6 +91,16 @@ class PET(ModelInterface[ModelHypers]):
         self.cutoff_cm_scaler = self.hypers["cutoff_cm_scaler"]
         self.transformer_type = self.hypers["transformer_type"]
         self.featurizer_type = self.hypers["featurizer_type"]
+        self.edge_features_from_nodes = self.hypers["edge_features_from_nodes"]
+        if self.edge_features_from_nodes:
+            if self.hypers["cutoff_edge_features"] is None:
+                raise ValueError(
+                    "`cutoff_edge_features` must be set when "
+                    "`edge_features_from_nodes` is enabled."
+                )
+            self.cutoff_edge_features = float(self.hypers["cutoff_edge_features"])
+        else:
+            self.cutoff_edge_features = self.cutoff
 
         self.atomic_types = dataset_info.atomic_types
         self.requested_nl = NeighborListOptions(
@@ -97,6 +108,16 @@ class PET(ModelInterface[ModelHypers]):
             full_list=True,
             strict=True,
         )
+        # Atom-pair edges are optionally enumerated at a separate (larger)
+        # cutoff; when disabled, this is the same neighbor list as the GNN.
+        if self.edge_features_from_nodes:
+            self.atom_pair_nl = NeighborListOptions(
+                cutoff=self.cutoff_edge_features,
+                full_list=True,
+                strict=True,
+            )
+        else:
+            self.atom_pair_nl = self.requested_nl
         num_atomic_species = len(self.atomic_types)
         self.gnn_layers = torch.nn.ModuleList(
             [
@@ -150,6 +171,18 @@ class PET(ModelInterface[ModelHypers]):
             ]
         )
         self.edge_embedder = torch.nn.Embedding(num_atomic_species, self.d_pet)
+
+        # Optional module that builds edge features for atom-pair targets from
+        # the node features of the two atoms of each edge. A dummy placeholder
+        # is used when disabled, to keep TorchScript happy.
+        if self.edge_features_from_nodes:
+            self.edge_featurizer = EdgeFeaturizerFromNodes(
+                num_layers=self.num_readout_layers,
+                d_node=self.d_node,
+                d_pet=self.d_pet,
+            )
+        else:
+            self.edge_featurizer = DummyEdgeFeaturizer()
 
         self.node_heads = torch.nn.ModuleDict()
         self.edge_heads = torch.nn.ModuleDict()
@@ -332,6 +365,11 @@ class PET(ModelInterface[ModelHypers]):
         return self
 
     def requested_neighbor_lists(self) -> List[NeighborListOptions]:
+        if self.edge_features_from_nodes:
+            # The atom-pair neighbor list is returned first so that the trainer,
+            # which uses ``requested_neighbor_lists()[0]`` to prepare atom-pair
+            # targets, enumerates them at ``cutoff_edge_features``.
+            return [self.atom_pair_nl, self.requested_nl]
         return [self.requested_nl]
 
     def forward(
@@ -452,7 +490,7 @@ class PET(ModelInterface[ModelHypers]):
         """
         device = systems[0].device
         return_dict: Dict[str, TensorMap] = {}
-        nl_options = self.requested_neighbor_lists()[0]
+        nl_options = self.requested_nl
 
         if self.single_label.values.device != device:
             self._move_labels_to_device(device)
@@ -488,7 +526,7 @@ class PET(ModelInterface[ModelHypers]):
             pair_sample_labels = get_per_atom_pair_sample_labels(
                 systems,
                 sample_labels,
-                nl_options,
+                self.atom_pair_nl,
             )
 
         if "mtt::aux::cutoff_stats" in outputs:
@@ -549,12 +587,34 @@ class PET(ModelInterface[ModelHypers]):
                 for k, v in features_dict.items():
                     return_dict[k] = v
 
+        # Optionally build edge features for atom-pair targets directly from the
+        # node features of the two atoms of each (atom-pair) edge.
+        node_derived_edge_features_list: List[torch.Tensor] = []
+        if self.edge_features_from_nodes:
+            with torch.profiler.record_function(
+                "PET::_calculate_node_derived_edge_features"
+            ):
+                (
+                    centers_ap,
+                    neighbors_ap,
+                    edge_vectors_ap,
+                    edge_distances_ap,
+                ) = get_atom_pair_edges(systems, self.atom_pair_nl)
+                node_derived_edge_features_list = self.edge_featurizer(
+                    node_features_list,
+                    centers_ap,
+                    neighbors_ap,
+                    edge_vectors_ap,
+                    edge_distances_ap,
+                )
+
         # **Stage 3: Last Layer Feature Computation**
         with torch.profiler.record_function("PET::_calculate_last_layer_features"):
             node_last_layer_features_dict, edge_last_layer_features_dict = (
                 self._calculate_last_layer_features(
                     node_features_list,
                     edge_features_list,
+                    node_derived_edge_features_list,
                 )
             )
             last_layer_features_dict = self._get_output_last_layer_features(
@@ -931,6 +991,7 @@ class PET(ModelInterface[ModelHypers]):
         self,
         node_features_list: List[torch.Tensor],
         edge_features_list: List[torch.Tensor],
+        node_derived_edge_features_list: List[torch.Tensor],
     ) -> Tuple[Dict[str, List[torch.Tensor]], Dict[str, List[torch.Tensor]]]:
         """
         Apply output-specific heads to node and edge features from each GNN layer.
@@ -938,6 +999,9 @@ class PET(ModelInterface[ModelHypers]):
 
         :param node_features_list: List of node feature tensors from each GNN layer.
         :param edge_features_list: List of edge feature tensors from each GNN layer.
+        :param node_derived_edge_features_list: List of node-derived edge feature
+            tensors (one per readout layer), used for ``atom_pair`` outputs when
+            ``edge_features_from_nodes`` is enabled. Empty otherwise.
         :return: Tuple of two dictionaries:
             - Dictionary mapping output names to lists of node last layer features
             - Dictionary mapping output names to lists of edge last layer features
@@ -954,13 +1018,22 @@ class PET(ModelInterface[ModelHypers]):
                     node_head(node_features_list[i])
                 )
 
-        # Calculating edge last layer features
+        # Calculating edge last layer features. For atom-pair outputs, these are
+        # optionally built from node features instead of the GNN edge features.
         for output_name, edge_heads in self.edge_heads.items():
             if output_name not in edge_last_layer_features_dict:
                 edge_last_layer_features_dict[output_name] = []
+            use_node_derived = (
+                self.edge_features_from_nodes
+                and self.outputs[output_name].sample_kind == "atom_pair"
+            )
             for i, edge_head in enumerate(edge_heads):
+                if use_node_derived:
+                    edge_features = node_derived_edge_features_list[i]
+                else:
+                    edge_features = edge_features_list[i]
                 edge_last_layer_features_dict[output_name].append(
-                    edge_head(edge_features_list[i])
+                    edge_head(edge_features)
                 )
 
         return node_last_layer_features_dict, edge_last_layer_features_dict
@@ -995,6 +1068,13 @@ class PET(ModelInterface[ModelHypers]):
         for output_name in node_last_layer_features_dict.keys():
             if not should_compute_last_layer_features(output_name, requested_outputs):
                 continue
+            if (
+                self.edge_features_from_nodes
+                and self.outputs[output_name].sample_kind == "atom_pair"
+            ):
+                # Node-derived edge features are per-edge and cannot be
+                # aggregated into the per-atom last-layer-features layout.
+                continue
             if output_name not in last_layer_features_dict:
                 last_layer_features_dict[output_name] = []
             for i in range(len(node_last_layer_features_dict[output_name])):
@@ -1018,6 +1098,10 @@ class PET(ModelInterface[ModelHypers]):
             # the corresponding output could be base_name or mtt::base_name
             if f"mtt::{base_name}" in last_layer_features_dict:
                 base_name = f"mtt::{base_name}"
+            if base_name not in last_layer_features_dict:
+                # No last-layer features were collected for this output (e.g.
+                # atom-pair outputs when ``edge_features_from_nodes`` is enabled).
+                continue
             last_layer_features_values = torch.cat(
                 last_layer_features_dict[base_name], dim=1
             )
@@ -1124,6 +1208,10 @@ class PET(ModelInterface[ModelHypers]):
                 edge_atomic_predictions_dict[output_name] = torch.jit.annotate(
                     List[List[torch.Tensor]], []
                 )
+                use_node_derived = (
+                    self.edge_features_from_nodes
+                    and self.outputs[output_name].sample_kind == "atom_pair"
+                )
                 for i, edge_last_layer in enumerate(edge_last_layers):
                     edge_last_layer_features = edge_last_layer_features_dict[
                         output_name
@@ -1133,21 +1221,35 @@ class PET(ModelInterface[ModelHypers]):
                         edge_atomic_predictions = edge_last_layer_by_block(
                             edge_last_layer_features
                         )
-                        expanded_padding_mask = padding_mask[..., None].repeat(
-                            1, 1, edge_atomic_predictions.shape[2]
-                        )
-                        edge_atomic_predictions = torch.where(
-                            ~expanded_padding_mask, 0.0, edge_atomic_predictions
-                        )
-                        if self.outputs[output_name].sample_kind == "atom_pair":
+                        if use_node_derived:
+                            # Node-derived edge features are already flat,
+                            # per-edge tensors: no NEF padding or indexing.
                             edge_atomic_predictions_by_block.append(
-                                edge_atomic_predictions[centers, nef_to_edges_neighbor]
+                                edge_atomic_predictions
                             )
                         else:
-                            edge_atomic_predictions *= cutoff_factors[:, :, None]
-                            edge_atomic_predictions_by_block.append(
-                                edge_atomic_predictions.sum(dim=1)
+                            expanded_padding_mask = padding_mask[..., None].repeat(
+                                1, 1, edge_atomic_predictions.shape[2]
                             )
+                            edge_atomic_predictions = torch.where(
+                                ~expanded_padding_mask, 0.0, edge_atomic_predictions
+                            )
+                            if (
+                                self.outputs[output_name].sample_kind
+                                == "atom_pair"
+                            ):
+                                edge_atomic_predictions_by_block.append(
+                                    edge_atomic_predictions[
+                                        centers, nef_to_edges_neighbor
+                                    ]
+                                )
+                            else:
+                                edge_atomic_predictions *= cutoff_factors[
+                                    :, :, None
+                                ]
+                                edge_atomic_predictions_by_block.append(
+                                    edge_atomic_predictions.sum(dim=1)
+                                )
                     edge_atomic_predictions_dict[output_name].append(
                         edge_atomic_predictions_by_block
                     )
@@ -1334,6 +1436,12 @@ class PET(ModelInterface[ModelHypers]):
         self.additive_models[0].weights_to(torch.device("cpu"), torch.float64)
 
         interaction_ranges = [self.num_gnn_layers * self.cutoff]
+        if self.edge_features_from_nodes:
+            # atom-pair edges reach ``cutoff_edge_features``, on top of the node
+            # receptive field of ``num_gnn_layers * cutoff``.
+            interaction_ranges.append(
+                self.num_gnn_layers * self.cutoff + self.cutoff_edge_features
+            )
         for additive_model in self.additive_models:
             if hasattr(additive_model, "cutoff_radius"):
                 interaction_ranges.append(additive_model.cutoff_radius)

@@ -195,6 +195,28 @@ class ModelHypers(TypedDict):
     scales and lower relative edge loss weight). Only used when
     :attr:`use_onsite_scales_for_offsite` is ``True``.
     """
+    edge_features_from_nodes: bool = False
+    """Build edge features for atom-pair targets directly from node features.
+
+    When ``True``, the edge features used to predict ``atom_pair`` targets (e.g.
+    the off-diagonal blocks of a Hamiltonian matrix) are computed as
+    ``MLP(concat(node_i, node_j, embedding(edge_vector_ij)))`` instead of being
+    read out from the (quadratically-scaling) edge transformer. This decouples
+    the GNN cutoff (:attr:`cutoff`) from the cutoff at which atom-pair edges are
+    enumerated (:attr:`cutoff_edge_features`), so the GNN can run at a small,
+    cheap cutoff while atom-pair targets are still predicted up to a larger
+    distance. Non-``atom_pair`` targets are unaffected. This is a supplementary
+    code path: when ``False``, the model behaves exactly as before.
+    """
+    cutoff_edge_features: Optional[float] = None
+    """Cutoff radius used to enumerate atom-pair edges.
+
+    Only used when :attr:`edge_features_from_nodes` is ``True``, in which case it
+    must be set. It should cover the full pair range of the atom-pair targets in
+    the dataset (the role :attr:`cutoff` plays for atom-pair targets when
+    :attr:`edge_features_from_nodes` is ``False``), and is typically larger than
+    :attr:`cutoff`.
+    """
 
 
 class TrainerHypers(TypedDict):
