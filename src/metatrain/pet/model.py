@@ -21,6 +21,7 @@ from metatrain.utils.abc import ModelInterface
 from metatrain.utils.additive import ZBL
 from metatrain.utils.data import DatasetInfo, TargetInfo
 from metatrain.utils.data.atomic_basis_helpers import (
+    _compute_sparse_properties,
     get_pair_sample_labels,
     densify_atomic_basis_dataset_info,
     sparsify_atomic_basis_target,
@@ -67,6 +68,7 @@ class PET(ModelInterface[ModelHypers]):
         references={"architecture": ["https://arxiv.org/abs/2305.19302v3"]}
     )
     component_labels: Dict[str, List[List[Labels]]]
+    target_sparse_properties: Dict[str, TensorMap]
     NUM_FEATURE_TYPES: int = 2  # node + edge features
 
     def __init__(self, hypers: ModelHypers, dataset_info: DatasetInfo) -> None:
@@ -126,6 +128,15 @@ class PET(ModelInterface[ModelHypers]):
                 ),
             ),
         }
+
+        # Cache the sparse-representation properties of atomic basis targets, so they
+        # don't need to be recomputed from the layout on every eval-mode forward call.
+        self.target_sparse_properties: Dict[str, TensorMap] = {}
+        for target_name, target_info in dataset_info.targets.items():
+            if target_info.is_atomic_basis:
+                self.target_sparse_properties[target_name] = _compute_sparse_properties(
+                    target_info.layout
+                )
 
         # Modified dataset_info with the targets as they will be seen by PET
         # during training.
@@ -216,6 +227,13 @@ class PET(ModelInterface[ModelHypers]):
                 f"New atomic types found in the dataset: {new_atomic_types}. "
                 "The PET model does not support adding new atomic types."
             )
+
+        # Cache the sparse-representation properties of any new atomic basis targets.
+        for target_name, target_info in new_targets.items():
+            if target_info.is_atomic_basis:
+                self.target_sparse_properties[target_name] = _compute_sparse_properties(
+                    target_info.layout
+                )
 
         # Modified dataset_info with the targets as they will be seen by PET
         # during training.
@@ -500,9 +518,12 @@ class PET(ModelInterface[ModelHypers]):
         # **Stages 3 & 4: Last Layer Features and Atomic Predictions**
         with torch.profiler.record_function("PET::predict"):
             requested_target_names: List[str] = []
+            atom_pair_output_names: List[str] = []
             for name in self.target_names:
                 if name in outputs:
                     requested_target_names.append(name)
+                    if outputs[name].sample_kind == "atom_pair":
+                        atom_pair_output_names.append(name)
             (
                 atomic_predictions,
                 node_last_layer_features_dict,
@@ -515,6 +536,15 @@ class PET(ModelInterface[ModelHypers]):
                 system_indices,
                 requested_target_names,
             )
+
+            pair_sample_labels: Optional[Labels] = None
+            if len(atom_pair_output_names) > 0:
+                pair_sample_labels = get_pair_sample_labels(
+                    sample_labels,
+                    batch_data["centers"],
+                    batch_data["neighbors"],
+                    batch_data["cell_shifts"],
+                )
 
         # **Stage 2: Intermediate Feature Output (Optional)**
         with torch.profiler.record_function("PET::_get_output_features"):
@@ -551,6 +581,7 @@ class PET(ModelInterface[ModelHypers]):
             atomic_predictions_dict = self._get_output_atomic_predictions(
                 atomic_predictions,
                 sample_labels,
+                pair_sample_labels,
                 outputs,
                 selected_atoms,
             )
@@ -585,12 +616,13 @@ class PET(ModelInterface[ModelHypers]):
                 # done before adding the additive contributions, which are also
                 # sparsified (by the additive models themselves, in eval mode).
                 for k in atomic_predictions_dict.keys():
-                    if self.dataset_info.targets[k].is_atomic_basis:
+                    if k in self.target_sparse_properties:
                         return_dict[k] = sparsify_atomic_basis_target(
                             systems,
                             return_dict[k],
-                            self.dataset_info.targets[k].layout,
-                            species,
+                            layout=None,
+                            atom_types_batch=species,
+                            sparse_properties=self.target_sparse_properties[k],
                         )
 
                 for additive_model in self.additive_models:
@@ -858,22 +890,28 @@ class PET(ModelInterface[ModelHypers]):
         self,
         atomic_predictions: Dict[str, List[torch.Tensor]],
         sample_labels: Labels,
+        pair_sample_labels: Optional[Labels],
         outputs: Dict[str, ModelOutput],
         selected_atoms: Optional[Labels],
     ) -> Dict[str, TensorMap]:
         """
         Wrap the per-block atomic predictions computed by the backend into TensorMaps.
-        Returns per-atom or per-structure predictions based on output configuration.
+        Returns per-atom, per-atom-pair, or per-structure predictions based on output
+        configuration.
 
         :param atomic_predictions: Dictionary mapping output names to lists of per-block
             flat prediction tensors, as returned by :meth:`PETBackend.predict` (the node
             and edge contributions are already summed and rank-2 Cartesian tensors are
             already symmetrized).
         :param sample_labels: Labels for all atoms in the batch [n_atoms, 2].
+        :param pair_sample_labels: Labels for all directed edges in the batch, with
+            columns ``["system", "first_atom", "second_atom", "cell_shift_a",
+            "cell_shift_b", "cell_shift_c"]``. Required (non-``None``) if any
+            requested output has ``sample_kind == "atom_pair"``.
         :param outputs: Dictionary of requested outputs.
         :param selected_atoms: Optional Labels specifying a subset of atoms to include.
         :return: Dictionary mapping requested output names to TensorMaps of
-            predictions, either per-atom or summed over atoms.
+            predictions: per-atom, per-atom-pair, or summed over atoms.
         """
         atomic_predictions_tmap_dict: Dict[str, TensorMap] = {}
         for output_name in self.target_names:
@@ -881,6 +919,11 @@ class PET(ModelInterface[ModelHypers]):
                 prediction_blocks = atomic_predictions[output_name]
                 blocks: List[TensorBlock] = []
                 block_index = 0
+                if outputs[output_name].sample_kind == "atom_pair":
+                    assert pair_sample_labels is not None
+                    samples = pair_sample_labels
+                else:
+                    samples = sample_labels
                 for shape, components, properties in zip(
                     self.output_shapes[output_name].values(),
                     self.component_labels[output_name],
@@ -890,7 +933,7 @@ class PET(ModelInterface[ModelHypers]):
                     blocks.append(
                         TensorBlock(
                             values=prediction_blocks[block_index].reshape([-1] + shape),
-                            samples=sample_labels,
+                            samples=samples,
                             components=components,
                             properties=properties,
                         )
@@ -909,12 +952,13 @@ class PET(ModelInterface[ModelHypers]):
                     tmap, axis="samples", selection=selected_atoms
                 )
 
-        # If per-atom predictions are requested, we return the atomic predictions
-        # tensor maps. Otherwise, we sum the atomic predictions over the atoms
-        # to get the final per-structure predictions for each requested output.
+        # If per-atom or per-atom-pair predictions are requested, we return the atomic
+        # predictions tensor maps as-is. Otherwise, we sum the atomic predictions over
+        # the atoms to get the final per-structure predictions for each requested
+        # output.
 
         for output_name, atomic_property in atomic_predictions_tmap_dict.items():
-            if outputs[output_name].sample_kind == "atom":
+            if outputs[output_name].sample_kind in ("atom", "atom_pair"):
                 atomic_predictions_tmap_dict[output_name] = atomic_property
             else:
                 atomic_predictions_tmap_dict[output_name] = sum_over_atoms(
@@ -1027,12 +1071,18 @@ class PET(ModelInterface[ModelHypers]):
         self.outputs[target_name] = ModelOutput(
             quantity=target_info.quantity,
             unit=target_info.unit,
-            sample_kind="atom",
+            sample_kind=target_info.sample_kind,
             description=target_info.description,
         )
 
-        # The learnable heads and last layers live on the pure-PyTorch backend.
-        self.backend.add_output(target_name, self.output_shapes[target_name])
+        # The learnable heads and last layers live on the pure-PyTorch backend. Node
+        # heads/last-layers are created for atom-pair (edge) targets too (only the
+        # edge contribution is used in the final prediction for them, for now - see
+        # ``PETBackend.predict``).
+        is_atom_pair = target_info.sample_kind == "atom_pair"
+        self.backend.add_output(
+            target_name, self.output_shapes[target_name], is_atom_pair
+        )
 
         # Register last-layer parameters, in the same order as they are returned as
         # last-layer features in the model (the modules live on ``self.backend``).

@@ -134,6 +134,7 @@ class PETBackend(torch.nn.Module):
         self.edge_heads = torch.nn.ModuleDict()
         self.node_last_layers = torch.nn.ModuleDict()
         self.edge_last_layers = torch.nn.ModuleDict()
+        self.is_atom_pair: Dict[str, bool] = {}
 
         # ===== BEGIN DIAGNOSTIC-RELATED ATTRIBUTES
         # These are used to capture the node and edge features from each GNN layer post
@@ -154,7 +155,12 @@ class PETBackend(torch.nn.Module):
         )
         # ===== END DIAGNOSTIC-RELATED ATTRIBUTES
 
-    def add_output(self, target_name: str, output_shapes: Dict[str, List[int]]) -> None:
+    def add_output(
+        self,
+        target_name: str,
+        output_shapes: Dict[str, List[int]],
+        is_atom_pair: bool = False,
+    ) -> None:
         """
         Create the node/edge heads and last layers for a new output target.
 
@@ -167,7 +173,16 @@ class PETBackend(torch.nn.Module):
         :param output_shapes: Mapping from per-block key to the block's shape (the
             component sizes followed by the number of properties), as computed by
             :meth:`metatrain.pet.model.PET._add_output`.
+        :param is_atom_pair: Whether this target is an atom-pair (edge) target. Node
+            heads/last-layers are created and computed for atom-pair targets just
+            like for any other target - so that the per-atom "node" prediction is
+            available for future use (e.g. forming edge predictions as a product of
+            node predictions) - but their output is currently unused: only the edge
+            contribution is used for the final prediction of atom-pair targets, see
+            :meth:`predict`.
         """
+        self.is_atom_pair[target_name] = is_atom_pair
+
         self.node_heads[target_name] = torch.nn.ModuleList(
             [
                 torch.nn.Sequential(
@@ -425,11 +440,17 @@ class PETBackend(torch.nn.Module):
         :param requested_output_names: Names of the target outputs to compute.
         :return: A tuple ``(atomic_predictions, node_ll_features, edge_ll_features)``
             where ``atomic_predictions`` maps each requested output to a list of
-            per-block flat prediction tensors, and the last-layer feature dictionaries
-            map each output to its per-layer node / edge last-layer features.
+            per-block flat prediction tensors (per-atom for node/system-kind outputs,
+            per-edge for atom-pair-kind outputs), and the last-layer feature
+            dictionaries map each output to its per-layer node / edge last-layer
+            features. Node predictions are computed for atom-pair (edge) targets too
+            (see :meth:`add_output`), but only the edge contribution is used to form
+            ``atomic_predictions``.
         """
         padding_mask = batch_data["padding_mask"]
         cutoff_factors = batch_data["cutoff_factors"]
+        centers = batch_data["centers"]
+        nef_to_edges_neighbor = batch_data["nef_to_edges_neighbor"]
 
         node_ll_features, edge_ll_features = self._calculate_last_layer_features(
             node_features_list,
@@ -443,23 +464,37 @@ class PETBackend(torch.nn.Module):
                 padding_mask,
                 cutoff_factors,
                 requested_output_names,
+                centers,
+                nef_to_edges_neighbor,
             )
         )
 
-        # Sum the node and edge contributions over all GNN layers, block by block.
+        # Sum the node and edge contributions over all GNN layers, block by block. Node
+        # predictions are computed for atom-pair (edge) outputs too (see `add_output`),
+        # but are discarded here. TODO: take products of node predictions. 
         atomic_predictions: Dict[str, List[torch.Tensor]] = {}
-        for output_name in node_atomic_predictions_dict.keys():
-            node_by_layer = node_atomic_predictions_dict[output_name]
+        for output_name in edge_atomic_predictions_dict.keys():
             edge_by_layer = edge_atomic_predictions_dict[output_name]
-            num_blocks = len(node_by_layer[0])
+            is_atom_pair = self.is_atom_pair[output_name]
+            num_blocks = len(edge_by_layer[0])
             block_sums: List[torch.Tensor] = []
-            for b in range(num_blocks):
-                block_sum = node_by_layer[0][b] + edge_by_layer[0][b]
-                for layer in range(1, len(node_by_layer)):
-                    block_sum = (
-                        block_sum + node_by_layer[layer][b] + edge_by_layer[layer][b]
-                    )
-                block_sums.append(block_sum)
+            if is_atom_pair:
+                for b in range(num_blocks):
+                    block_sum = edge_by_layer[0][b]
+                    for layer in range(1, len(edge_by_layer)):
+                        block_sum = block_sum + edge_by_layer[layer][b]
+                    block_sums.append(block_sum)
+            else:
+                node_by_layer = node_atomic_predictions_dict[output_name]
+                for b in range(num_blocks):
+                    block_sum = node_by_layer[0][b] + edge_by_layer[0][b]
+                    for layer in range(1, len(node_by_layer)):
+                        block_sum = (
+                            block_sum
+                            + node_by_layer[layer][b]
+                            + edge_by_layer[layer][b]
+                        )
+                    block_sums.append(block_sum)
 
             if output_name == "non_conservative_stress":  # TODO: variants
                 num_properties = block_sums[0].shape[1] // 9
@@ -674,6 +709,8 @@ class PETBackend(torch.nn.Module):
         padding_mask: torch.Tensor,
         cutoff_factors: torch.Tensor,
         requested_output_names: List[str],
+        centers: torch.Tensor,
+        nef_to_edges_neighbor: torch.Tensor,
     ) -> Tuple[
         Dict[str, List[List[torch.Tensor]]], Dict[str, List[List[torch.Tensor]]]
     ]:
@@ -681,6 +718,14 @@ class PETBackend(torch.nn.Module):
         Apply final linear layers to last layer features to produce
         per-atom predictions. Handles multiple blocks per output and sums
         edge contributions with cutoff weighting.
+
+        Atom-pair (edge) targets are identified via ``self.is_atom_pair`` (set in
+        :meth:`add_output`): for these, the edge contribution is gathered directly
+        to a flat per-edge tensor via ``[centers, nef_to_edges_neighbor]`` instead of
+        being pooled (cutoff-weighted sum) over neighbors into a per-atom tensor.
+        Node predictions are still computed for atom-pair targets (see
+        :meth:`add_output`), even though they are currently unused for them - see
+        :meth:`predict`.
 
         :param node_last_layer_features_dict: Dictionary mapping output names to
             lists of node last layer features.
@@ -691,11 +736,18 @@ class PETBackend(torch.nn.Module):
         :param cutoff_factors: Tensor of cutoff factors for edge distances
             [n_atoms, max_num_neighbors].
         :param requested_output_names: Names of the target outputs to compute.
+        :param centers: Flat center atom global indices for each real (non-padded)
+            edge, shape ``(n_edges,)``.
+        :param nef_to_edges_neighbor: Index tensor of shape ``(n_edges,)`` such that
+            ``nef_tensor[centers, nef_to_edges_neighbor]`` recovers the flat edge
+            array from a NEF-format tensor.
         :return: Tuple of two dictionaries:
             - Dictionary mapping output names to lists of lists of node atomic
               prediction tensors (one list per GNN layer, one tensor per block)
             - Dictionary mapping output names to lists of lists of edge atomic
-              prediction tensors (one list per GNN layer, one tensor per block)
+              prediction tensors (one list per GNN layer, one tensor per block).
+              For atom-pair-kind outputs these are per-edge, shape ``(n_edges, d)``;
+              for all other outputs they are per-atom, shape ``(n_atoms, d)``.
         """
         node_atomic_predictions_dict: Dict[str, List[List[torch.Tensor]]] = {}
         edge_atomic_predictions_dict: Dict[str, List[List[torch.Tensor]]] = {}
@@ -731,6 +783,7 @@ class PETBackend(torch.nn.Module):
                 edge_atomic_predictions_dict[output_name] = torch.jit.annotate(
                     List[List[torch.Tensor]], []
                 )
+                is_atom_pair = self.is_atom_pair[output_name]
                 for i, edge_last_layer in enumerate(edge_last_layers):
                     edge_last_layer_features = edge_last_layer_features_dict[
                         output_name
@@ -740,17 +793,27 @@ class PETBackend(torch.nn.Module):
                         edge_atomic_predictions = edge_last_layer_by_block(
                             edge_last_layer_features
                         )
-                        expanded_padding_mask = padding_mask[..., None].repeat(
-                            1, 1, edge_atomic_predictions.shape[2]
-                        )
-                        edge_atomic_predictions = torch.where(
-                            ~expanded_padding_mask, 0.0, edge_atomic_predictions
-                        )
-                        edge_atomic_predictions_by_block.append(
-                            (edge_atomic_predictions * cutoff_factors[:, :, None]).sum(
-                                dim=1
+                        if is_atom_pair:
+                            # Gather the raw per-edge (NEF-format) predictions directly
+                            # into a flat per-edge tensor, one row per real (non-padded)
+                            # edge - no cutoff weighting or neighbor pooling, since each
+                            # edge is its own sample.
+                            edge_atomic_predictions_by_block.append(
+                                edge_atomic_predictions[centers, nef_to_edges_neighbor]
                             )
-                        )
+                        else:
+                            expanded_padding_mask = padding_mask[..., None].repeat(
+                                1, 1, edge_atomic_predictions.shape[2]
+                            )
+                            edge_atomic_predictions = torch.where(
+                                ~expanded_padding_mask, 0.0, edge_atomic_predictions
+                            )
+                            edge_atomic_predictions_by_block.append(
+                                (
+                                    edge_atomic_predictions
+                                    * cutoff_factors[:, :, None]
+                                ).sum(dim=1)
+                            )
                     edge_atomic_predictions_dict[output_name].append(
                         edge_atomic_predictions_by_block
                     )

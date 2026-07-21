@@ -172,6 +172,7 @@ class Trainer(TrainerInterface[TrainerHypers]):
             target_info_dict=train_targets, extra_data_info_dict=extra_data_info
         )
         requested_neighbor_lists = get_requested_neighbor_lists(model)
+        nl_options = requested_neighbor_lists[0]
         max_atoms = self.hypers["max_atoms_per_batch"]
         # When max_atoms_per_batch is set, batches are pre-filtered by atom count at
         # construction time, so batch_atom_bounds filtering in the collate function is
@@ -180,8 +181,13 @@ class Trainer(TrainerInterface[TrainerHypers]):
             None if max_atoms is not None else self.hypers["batch_atom_bounds"]
         )
         atomic_basis_transform, atomic_basis_reverse_transform = (
-            get_prepare_atomic_basis_targets_transform(train_targets, extra_data_info)
+            get_prepare_atomic_basis_targets_transform(
+                train_targets, extra_data_info, nl_options
+            )
         )
+        # Neighbor lists must be computed before `atomic_basis_transform` to allow
+        # padding of atom-pair targets.
+        nl_transform = get_system_with_neighbor_lists_transform(requested_neighbor_lists)
 
         train_or_load_composition_model(
             composition_model=model.additive_models[0],
@@ -201,8 +207,11 @@ class Trainer(TrainerInterface[TrainerHypers]):
                 self.hypers["batch_size"],
                 is_distributed,
                 self.hypers["fixed_scaling_weights"],
-                initial_transforms=[atomic_basis_transform],
+                initial_transforms=[nl_transform, atomic_basis_transform],
                 per_structure_targets=self.hypers["per_structure_targets"],
+                use_onsite_scales_for_offsite=self.hypers[
+                    "use_onsite_scales_for_offsite"
+                ],
             )
 
         logging.info("Setting up data loaders")
@@ -270,7 +279,8 @@ class Trainer(TrainerInterface[TrainerHypers]):
         # Shared callables that run after `atomic_basis_transform` (and after
         # rotational augmentation in training).
         base_callables: List[Callable[..., Any]] = [
-            get_system_with_neighbor_lists_transform(requested_neighbor_lists),
+            nl_transform,
+            atomic_basis_transform,
             *conditioning_callables,
             get_remove_additive_transform(additive_models, train_targets),
             get_remove_scale_transform(scaler),
@@ -278,18 +288,16 @@ class Trainer(TrainerInterface[TrainerHypers]):
         collate_fn_train = CollateFn(
             target_keys=target_keys,
             callables=[
-                atomic_basis_transform,
+                base_callables[0],
+                base_callables[1],
                 rotational_augmenter.apply_random_augmentations,
-                *base_callables,
+                *base_callables[2:],
             ],
             batch_atom_bounds=batch_atom_bounds,
         )
         collate_fn_val = CollateFn(
             target_keys=target_keys,
-            callables=[  # no augmentation for validation
-                atomic_basis_transform,
-                *base_callables,
-            ],
+            callables=base_callables,  # no augmentation for validation
             batch_atom_bounds=batch_atom_bounds,
         )
 

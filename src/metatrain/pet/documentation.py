@@ -344,6 +344,19 @@ class TrainerHypers(TypedDict):
     :meth:`Scaler.train_model <metatrain.utils.scaler.scaler.Scaler.train_model>`,
     see its documentation to understand exactly what to pass here.
     """
+    use_onsite_scales_for_offsite: bool = False
+    """Use onsite (per-atom) target scales as a proxy for offsite (atom-pair) ones.
+
+    Atom-pair (edge) targets are never scaled from their own data. If ``True`` and
+    an atom-pair target follows the ``mtt::matrix_edges::X`` naming convention with
+    a matching per-atom ``mtt::matrix_nodes::X`` target present, the edge target's
+    scales are overridden with a geometric-mean proxy derived from the node
+    target's per-atom-type scales. If ``False`` (the default), atom-pair targets
+    are left at their default scale of 1.0.
+
+    This is passed to the ``use_onsite_scales_for_offsite`` argument of
+    :meth:`Scaler.train_model <metatrain.utils.scaler.scaler.Scaler.train_model>`.
+    """
     per_structure_targets: list[str] = []
     """Targets to calculate per-structure losses and errors on."""
     num_workers: Optional[int] = None
