@@ -20,9 +20,9 @@ from metatrain.composition import CompositionModel
 from metatrain.utils.abc import ModelInterface
 from metatrain.utils.additive import ZBL
 from metatrain.utils.data import DatasetInfo, TargetInfo
+from metatrain.utils.data.atom_pair_helpers import get_pair_sample_labels
 from metatrain.utils.data.atomic_basis_helpers import (
     _compute_sparse_properties,
-    get_pair_sample_labels,
     densify_atomic_basis_dataset_info,
     sparsify_atomic_basis_target,
 )

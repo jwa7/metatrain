@@ -1,2 +1,2 @@
-from .exponential import Exponential
-from .tabulated import Tabulated
+from .exponential import Exponential as Exponential
+from .tabulated import Tabulated as Tabulated

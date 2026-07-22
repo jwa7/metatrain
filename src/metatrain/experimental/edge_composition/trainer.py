@@ -266,13 +266,13 @@ class Trainer(TrainerInterface):
                 ).batched_neighborlist = extra_data["batched_neighborlist"]
 
                 raw_targets = {}
-                for target_name, target_info in train_targets.items():
+                for target_name in train_targets.items():
                     target_vals = []
-                    for key, block in targets[target_name].items():
+                    for block in targets[target_name]:
                         target_vals.append(block.values.ravel())
                     raw_targets[target_name] = torch.cat(target_vals, dim=0)
 
-                for step in range(self.hypers["steps_per_batch"]):
+                for _ in range(self.hypers["steps_per_batch"]):
                     optimizer.zero_grad()
 
                     predictions = evaluate_model(
@@ -285,8 +285,8 @@ class Trainer(TrainerInterface):
                     train_loss_batch = loss_fn(predictions, targets, extra_data)
 
                     if is_distributed:
-                        # make sure all parameters contribute to the gradient calculation
-                        # to make torch DDP happy
+                        # make sure all parameters contribute to the gradient
+                        # calculation to make torch DDP happy
                         for param in model.parameters():
                             train_loss_batch += 0.0 * param.sum()
 
