@@ -52,9 +52,11 @@ class Scaler(ModelInterface[ModelHypers]):
 
         self.atomic_types = sorted(dataset_info.atomic_types)
 
+        # Skip atom-pair targets
         self.target_infos = {
             target_name: target_info
             for target_name, target_info in dataset_info.targets.items()
+            if target_info.sample_kind != "atom_pair"
         }
 
         # Initialize the scaler model
@@ -180,6 +182,8 @@ class Scaler(ModelInterface[ModelHypers]):
         self.target_infos = {
             target_name: merged_info.targets[target_name]
             for target_name in merged_info.targets
+            if target_name not in self.dataset_info.targets
+            and dense_new_targets[target_name].sample_kind != "atom_pair"
         }
 
         # register new outputs

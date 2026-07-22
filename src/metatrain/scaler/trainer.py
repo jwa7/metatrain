@@ -192,7 +192,15 @@ class Trainer(TrainerInterface[TrainerHypers, ModelHypers]):
             # Make sure the data is transformed to what the scaler needs.
             atomic_basis_transform, _ = get_prepare_atomic_basis_targets_transform(
                 model.dataset_info,
-                scaler.dataset_info,
+                DatasetInfo(
+                    length_unit=scaler.dataset_info.length_unit,
+                    atomic_types=scaler.dataset_info.atomic_types,
+                    targets={
+                        k: v
+                        for k, v in scaler.dataset_info.targets.items()
+                        if k in scaler.target_infos
+                    },
+                ),
             )
             initial_transforms.append(atomic_basis_transform)
 
@@ -230,6 +238,7 @@ class Trainer(TrainerInterface[TrainerHypers, ModelHypers]):
                             target_name: scaler.target_infos[target_name]
                             for target_name in targets
                         },
+                        extra_data=extra_data,
                     )
                 targets = average_by_num_atoms(targets, systems, per_structure_targets)
                 scaler.model.accumulate(systems, targets, extra_data)
@@ -285,6 +294,7 @@ class Trainer(TrainerInterface[TrainerHypers, ModelHypers]):
                             target_name: scaler.target_infos[target_name]
                             for target_name in targets
                         },
+                        extra_data=extra_data,
                     )
                 targets = average_by_num_atoms(targets, systems, per_structure_targets)
                 scaler.model.accumulate_per_property(systems, targets, extra_data)
