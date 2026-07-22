@@ -1,5 +1,6 @@
 import torch
 
+
 class Tabulated(torch.nn.Module):
     def __init__(self, n_props, x_min=0, x_max=12, dx=0.1):
         super().__init__()
@@ -27,11 +28,16 @@ class Tabulated(torch.nn.Module):
         values_ceil = self.radial_tables[:, x_indices_ceil]
 
         # Linear interpolation
-        weights = (x - self.x[x_indices_floor]) / (self.x[x_indices_ceil] - self.x[x_indices_floor])
+        weights = (x - self.x[x_indices_floor]) / (
+            self.x[x_indices_ceil] - self.x[x_indices_floor]
+        )
         interpolated_values = (1 - weights) * values_floor + weights * values_ceil
 
-        assert interpolated_values.shape[0] == self.radial_tables.shape[0], "Interpolated values shape mismatch"
-        assert interpolated_values.shape[1] == x.shape[0], "Interpolated values shape mismatch with input x"
+        assert interpolated_values.shape[0] == self.radial_tables.shape[0], (
+            "Interpolated values shape mismatch"
+        )
+        assert interpolated_values.shape[1] == x.shape[0], (
+            "Interpolated values shape mismatch with input x"
+        )
 
         return interpolated_values.T
-        

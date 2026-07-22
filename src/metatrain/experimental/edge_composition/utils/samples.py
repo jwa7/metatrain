@@ -1,4 +1,5 @@
 from typing import Literal, Optional
+
 import torch
 from metatensor.torch import Labels, TensorBlock, TensorMap
 
@@ -34,7 +35,11 @@ def match_samples(
                     ),
                     samples=Labels(
                         names=ref_block.samples.names,
-                        values=torch.empty((0, ref_block.samples.values.shape[1]), dtype=torch.long, device=ref_block.samples.values.device),
+                        values=torch.empty(
+                            (0, ref_block.samples.values.shape[1]),
+                            dtype=torch.long,
+                            device=ref_block.samples.values.device,
+                        ),
                     ),
                     components=ref_block.components,
                     properties=ref_block.properties,
@@ -70,11 +75,10 @@ def match_samples(
 
             new_blocks.append(new_block)
 
-        matched[target_name] = TensorMap(
-            keys=ref_tmap.keys, blocks=new_blocks
-        )
+        matched[target_name] = TensorMap(keys=ref_tmap.keys, blocks=new_blocks)
 
     return matched
+
 
 def _labels_select(
     requested: Labels, available: Labels
@@ -91,9 +95,7 @@ def _labels_select(
         - Indices to go from the available labels to the intersection labels.
     """
     # Find the intersection of the requested samples and the block's samples
-    intersec_samples, req_select, select = requested.intersection_and_mapping(
-        available
-    )
+    intersec_samples, req_select, select = requested.intersection_and_mapping(available)
 
     # "select" gives you the index of the intersection where each available label
     # entry landed. We want the opposite: for each intersection label entry, we
@@ -111,6 +113,7 @@ def _labels_select(
     inv_select[select[mask]] = arange[mask]
 
     return req_select, inv_select
+
 
 def sample_from_tensorblock(
     block: TensorBlock,
@@ -132,7 +135,11 @@ def sample_from_tensorblock(
     properties = properties or block.properties
     # Initialize the returned block's values
     values = torch.full(
-        (samples.values.shape[0], *block.values.shape[1:-1], properties.values.shape[0]),
+        (
+            samples.values.shape[0],
+            *block.values.shape[1:-1],
+            properties.values.shape[0],
+        ),
         missing_value,
         dtype=block.values.dtype,
         device=block.values.device,
@@ -147,9 +154,12 @@ def sample_from_tensorblock(
     # Get the masks that tell us whether a given request is present.
     is_sample_present = (samples_select >= 0).nonzero().ravel()
     is_prop_present = (props_select >= 0).nonzero().ravel()
-    
-    # Reorder the existing values to match the order of the requested samples and properties.
-    reordered = existing_values[samples_select[is_sample_present]][..., props_select[is_prop_present]]
+
+    # Reorder the existing values to match the order of the requested samples and
+    # properties.
+    reordered = existing_values[samples_select[is_sample_present]][
+        ..., props_select[is_prop_present]
+    ]
 
     # Set them. It is a bit tricky to set values using the two masks,
     # that's why the following looks hacky, but in essence we are
@@ -212,7 +222,7 @@ def match_samples_to_neighborlist_and_layout(
     fill_value: float = 0.0,
 ) -> dict[str, TensorMap]:
     type_keys = {}
-    for block_key, layout_block in layout.items():
+    for block_key in layout.keys:
         type1, type2 = block_key["first_atom_type"], block_key["second_atom_type"]
         if (type1, type2) not in type_keys:
             type_keys[(type1, type2)] = []
@@ -243,10 +253,12 @@ def match_samples_to_neighborlist_and_layout(
             except ValueError:
                 block = layout_block
 
-            new_block = sample_from_tensorblock(block, nl_samples, layout_block.properties, missing_value=fill_value)
+            new_block = sample_from_tensorblock(
+                block, nl_samples, layout_block.properties, missing_value=fill_value
+            )
 
             new_blocks.append(new_block)
-            new_keys.append(block_key.values)        
+            new_keys.append(block_key.values)
 
     return TensorMap(
         keys=Labels(names=tmap.keys.names, values=torch.stack(new_keys)),

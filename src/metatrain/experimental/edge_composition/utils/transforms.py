@@ -4,6 +4,8 @@ from typing import Optional
 import torch
 from elearn.interface.metatensor.couple import (
     couple_tensor_blocks,
+)
+from elearn.interface.metatensor.couple import (
     uncouple_tensor_blocks as _uncouple_tensor_blocks,
 )
 from featomic.torch.clebsch_gordan._coefficients import calculate_cg_coefficients
@@ -11,7 +13,11 @@ from metatensor.torch import Labels, TensorBlock, TensorMap
 from metatomic.torch import NeighborListOptions, System
 from torch import Tensor
 
-from .samples import match_samples_to_neighborlist, match_samples_to_neighborlist_and_layout
+from .samples import (
+    match_samples_to_neighborlist,
+    match_samples_to_neighborlist_and_layout,
+)
+
 
 def uncouple_tensor_blocks(*args, **kwargs) -> TensorMap:
     """Elearn's uncouple_tensor_blocks function does not
@@ -19,19 +25,23 @@ def uncouple_tensor_blocks(*args, **kwargs) -> TensorMap:
     wrapper adds them."""
     coupled = _uncouple_tensor_blocks(*args, **kwargs)
 
-    keys_names = coupled.keys.names[:2] + ["o3_sigma_1", "o3_sigma_2"] + coupled.keys.names[2:]
+    keys_names = (
+        coupled.keys.names[:2] + ["o3_sigma_1", "o3_sigma_2"] + coupled.keys.names[2:]
+    )
     keys_values = torch.concatenate(
         [
             coupled.keys.values[:, :2],
-            torch.ones((coupled.keys.values.shape[0], 2), dtype=coupled.keys.values.dtype, device=coupled.keys.values.device),
-            coupled.keys.values[:, 2:]
-        ], dim=1
+            torch.ones(
+                (coupled.keys.values.shape[0], 2),
+                dtype=coupled.keys.values.dtype,
+                device=coupled.keys.values.device,
+            ),
+            coupled.keys.values[:, 2:],
+        ],
+        dim=1,
     )
 
-    keys = Labels(
-        names=keys_names,
-        values=keys_values
-    )
+    keys = Labels(names=keys_names, values=keys_values)
 
     return TensorMap(
         keys=keys,
@@ -155,8 +165,8 @@ def radial_to_spherical_harmonics(
             shs2 = shs[:, int(l2**2) : int(l2**2 + (2 * l2 + 1))]
             sph_out = torch.einsum("sp, sC, sc -> sCcp", radial_out, shs1, shs2)
         else:
-            l = block_key["o3_lambda"]
-            shs1 = shs[:, int(l**2) : int(l**2 + (2 * l + 1))]
+            ell = block_key["o3_lambda"]
+            shs1 = shs[:, int(ell**2) : int(ell**2 + (2 * ell + 1))]
             sph_out = torch.einsum("sp, sC -> sCp", radial_out, shs1)
 
         samples = batched_neighborlist.block(
@@ -193,7 +203,7 @@ def spherical_harmonics_to_radial(sph_tmap, all_shs, layout, batched_neighborlis
     rank = len(sph_tmap.block(0).components)
 
     radial_values = {}
-    for block_key, layout_block in layout.items():
+    for block_key in layout.keys:
         try:
             sph_block = sph_tmap.block(block_key)
         except ValueError:
@@ -212,8 +222,8 @@ def spherical_harmonics_to_radial(sph_tmap, all_shs, layout, batched_neighborlis
                 "sCcp, sC, sc -> sp", sph_block.values, shs1, shs2
             )
         else:
-            l, sigma, type1, type2 = block_key
-            shs1 = shs[:, l**2 : l**2 + (2 * l + 1)]
+            ell, sigma, type1, type2 = block_key
+            shs1 = shs[:, ell**2 : ell**2 + (2 * ell + 1)]
             radial_vals = torch.einsum("sCp, sC -> sp", sph_block.values, shs1)
 
         if (type1, type2) not in radial_values:

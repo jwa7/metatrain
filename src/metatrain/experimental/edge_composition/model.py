@@ -62,9 +62,9 @@ class UnitarySphericalHarmonics(torch.nn.Module):
         # compute a correction from the convention used by the
         # calculator.
         factors = torch.ones((max_l + 1) ** 2)
-        for l in range(max_l + 1):
-            start, end = l**2, l**2 + 2 * l + 1
-            factors[start:end] = 1 / SPHERICART_NORMS[l]
+        for ell in range(max_l + 1):
+            start, end = ell**2, ell**2 + 2 * ell + 1
+            factors[start:end] = 1 / SPHERICART_NORMS[ell]
 
         self.register_buffer("_factors", factors)
 
@@ -124,8 +124,9 @@ class EdgeCompositionModel(ModelInterface[ModelHypers]):
         """
         if target_info.sample_kind != "atom_pair":
             raise ValueError(
-                f"EdgeCompositionModel only supports targets with sample_kind 'atom_pair'. "
-                f"{target_name} has sample_kind '{target_info.sample_kind}'."
+                f"EdgeCompositionModel only supports targets with "
+                f"``sample_kind='atom_pair'``. {target_name} "
+                f"has sample_kind '{target_info.sample_kind}'."
             )
 
         is_coupled = self.hypers["sph_basis"] == "coupled"
@@ -142,8 +143,8 @@ class EdgeCompositionModel(ModelInterface[ModelHypers]):
         n_props_per_type_pair = defaultdict(int)
         for block_key, block in layout.items():
             if is_coupled:
-                l, o3_sigma, type1, type2 = block_key
-                self.max_l = max(self.max_l, l)
+                ell, o3_sigma, type1, type2 = block_key
+                self.max_l = max(self.max_l, ell)
             else:
                 l1, l2, o3_sigma_1, o3_sigma_2, type1, type2 = block_key
                 self.max_l = max(self.max_l, l1, l2)
@@ -153,10 +154,9 @@ class EdgeCompositionModel(ModelInterface[ModelHypers]):
                 n_props_per_type_pair[type1, type2] + n_props
             )
 
-        radial_cls = {
-            "exponential": Exponential,
-            "tabulated": Tabulated
-        }[self.hypers["radial_basis"]]
+        radial_cls = {"exponential": Exponential, "tabulated": Tabulated}[
+            self.hypers["radial_basis"]
+        ]
 
         for (type1, type2), n_props in n_props_per_type_pair.items():
             self.radials[target_name][str((type1, type2))] = radial_cls(n_props)
