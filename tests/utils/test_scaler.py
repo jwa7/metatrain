@@ -1,4 +1,5 @@
 import copy
+import logging
 import math
 
 import metatensor.torch
@@ -2466,3 +2467,101 @@ def test_scaler_torchscript(tmpdir):
         scaler = torch.jit.load(tmpdir / "scaler.pt")
 
     scaler(systems, fake_output)
+
+
+# ---------------------------------------------------------------------------
+# apply_onsite_scales_for_offsite: onsite-scale proxy for atom-pair targets
+# ---------------------------------------------------------------------------
+
+
+def _uncoupled_node_layout(block_keys):
+    """Per-atom (node) matrix layout in the uncoupled (cartesian-product) basis.
+
+    Uses the standard uncoupled node key order
+    ``[o3_lambda_1, o3_lambda_2, o3_sigma_1, o3_sigma_2, atom_type]``.
+    ``block_keys`` is a list of ``(l1, l2, s1, s2, atom_type)`` tuples.
+    """
+    keys = Labels(
+        ["o3_lambda_1", "o3_lambda_2", "o3_sigma_1", "o3_sigma_2", "atom_type"],
+        torch.tensor(block_keys, dtype=torch.int32),
+    )
+    blocks = [
+        TensorBlock(
+            values=torch.zeros(1, 1, dtype=torch.float64),
+            samples=Labels(["system", "atom"], torch.tensor([[0, 0]])),
+            components=[],
+            properties=Labels(["p"], torch.tensor([[0]])),
+        )
+        for _ in block_keys
+    ]
+    return TensorMap(keys, blocks)
+
+
+def _edge_layout():
+    """Minimal atom-pair (edge) matrix layout in the uncoupled basis."""
+    keys = Labels(
+        [
+            "o3_lambda_1",
+            "o3_lambda_2",
+            "o3_sigma_1",
+            "o3_sigma_2",
+            "first_atom_type",
+            "second_atom_type",
+        ],
+        torch.tensor([[0, 0, 1, 1, 1, 1]], dtype=torch.int32),
+    )
+    block = TensorBlock(
+        values=torch.zeros(1, 1, dtype=torch.float64),
+        samples=Labels(
+            [
+                "system",
+                "first_atom",
+                "second_atom",
+                "cell_shift_a",
+                "cell_shift_b",
+                "cell_shift_c",
+            ],
+            torch.tensor([[0, 0, 0, 0, 0, 0]]),
+        ),
+        components=[],
+        properties=Labels(["p"], torch.tensor([[0]])),
+    )
+    return TensorMap(keys, [block])
+
+
+def _set_node_scales(scaler, node_name, per_type_scales):
+    # All blocks of a node target share the same per-type scale vector.
+    s = torch.tensor(per_type_scales, dtype=torch.float64).reshape(-1, 1)
+    tm = scaler.per_target_scales[node_name]
+    for i in range(len(tm)):
+        tm.block_by_id(i).values[:] = s
+
+
+def test_apply_onsite_scales_uncoupled_basis(caplog):
+    """The invariant/diagonal node block must be found in the uncoupled basis
+    (suffixed ``o3_sigma_1``/... key names), so edge scales get the geometric-mean
+    proxy rather than being silently left at 1.0."""
+    from metatrain.utils.scaler._base_scaler import BaseScaler
+
+    atom_types = [1, 8]
+    node_name = "mtt::matrix_nodes::ham"
+    edge_name = "mtt::matrix_edges::ham"
+
+    # s-s invariant/diagonal blocks (l1=l2=0, s1=s2=1) for atom types 1 and 8.
+    scaler = BaseScaler(
+        atom_types,
+        {
+            node_name: _uncoupled_node_layout([[0, 0, 1, 1, 1], [0, 0, 1, 1, 8]]),
+            edge_name: _edge_layout(),
+        },
+    )
+    _set_node_scales(scaler, node_name, [2.0, 3.0])  # type 1 -> 2, type 8 -> 3
+
+    with caplog.at_level(logging.WARNING):
+        scaler.apply_onsite_scales_for_offsite(node_name, edge_name)
+
+    assert "could not find" not in caplog.text
+    edge_vals = scaler.per_target_scales[edge_name].block_by_id(0).values.squeeze(-1)
+    # samples: product((0,1),(0,1)) -> (0,0),(0,1),(1,0),(1,1); sqrt(s_I * s_J)
+    expected = torch.tensor([2.0, 6.0**0.5, 6.0**0.5, 3.0], dtype=torch.float64)
+    torch.testing.assert_close(edge_vals, expected)

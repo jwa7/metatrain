@@ -908,14 +908,12 @@ class BaseScaler(torch.nn.Module):
         node_key_names: List[str] = list(node_pt.keys.names)
 
         # For each atomic type (indexed by its position in `self.atomic_types`),
-        # look up the node target's scale (taking from the invariant block,
-        # though all blocks have the same value).
+        # look up the node target's scale from the invariant / diagonal block.
+        sigma_names = ("o3_sigma", "o3_sigma_1", "o3_sigma_2")
         type_scale: Dict[int, torch.Tensor] = {}
         for i_type, atomic_type in enumerate(self.atomic_types.tolist()):
             node_key = [
-                atomic_type
-                if n == "atom_type"
-                else (0 if n == "o3_lambda" else 1 if n == "o3_sigma" else 0)
+                atomic_type if n == "atom_type" else (1 if n in sigma_names else 0)
                 for n in node_key_names
             ]
             pos = node_pt.keys.position(node_key)
