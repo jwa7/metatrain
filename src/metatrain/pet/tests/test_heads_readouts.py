@@ -12,7 +12,7 @@ import torch
 from metatomic.torch import ModelOutput, System
 
 from metatrain.pet import PET
-from metatrain.pet.modules.readouts import LinearReadout
+from metatrain.utils.readout import LinearReadout
 from metatrain.utils.architectures import get_default_hypers
 from metatrain.utils.data import DatasetInfo
 from metatrain.utils.data.target_info import (

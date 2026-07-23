@@ -1,48 +1,51 @@
-"""Linear readout ("last layer") modules for PET, with optional atom-type gating.
+"""Linear readout ("last layer") modules with optional atom-type gating.
 
-The readout maps last-layer (head) features to a block's output dimension. It is
-always a *linear* map — any nonlinearity lives in the per-block heads that
-precede it (see ``head_type`` / ``num_head_layers``). Two flavours of atom-type
-gating are provided:
+Architecture-agnostic building blocks that map per-row features to an output
+dimension with a strictly *linear* map (any nonlinearity is expected to live in
+whatever produces the input features). Two modules are provided:
 
-* :class:`LinearReadout` — a single shared linear map (``gated=False``, the
-  vanilla readout) or one independent linear map per atom-type group
-  (``gated=True``, "one-hot" conditioning). Groups are the central-atom type for
-  per-atom(-derived) contributions, or the flat pair index ``Z_I * n + Z_J`` for
-  per-atom-pair targets.
+* :class:`LinearReadout` — a single shared linear map (``gated=False``) or one
+  independent linear map per group (``gated=True``, "one-hot" conditioning). For
+  atomistic models the groups are typically the central-atom type (per-atom
+  conditioning) or a flat pair index ``Z_I * n + Z_J`` (per-atom-pair
+  conditioning), but the module is agnostic to what ``group_idx`` means.
 * :class:`MoEReadout` — a mixture of linear experts gated by routing weights
-  derived from an embedding of the central-atom type. Per-atom targets only.
+  derived from an embedding of the group index.
 
 Both modules share the forward signature ``(features, group_idx) -> predictions``
 so they are interchangeable, and both are TorchScript-compatible.
+
+The ``bias`` constructor argument toggles a learnable bias. It defaults to
+``False``, which is the safe choice for equivariant models (a bias on a
+non-invariant output would break equivariance). Non-equivariant models should
+pass ``bias=True`` to recover the standard affine linear layer.
 """
 
 import math
-from typing import List
+from typing import List, Optional
 
 import torch
 
 
 class LinearReadout(torch.nn.Module):
-    """Linear readout, optionally atom-type gated ("one-hot").
+    """Linear readout, optionally group-gated ("one-hot").
 
-    :param in_features: Input (head) feature dimension.
-    :param out_features: Output feature dimension for the block.
+    :param in_features: Input feature dimension.
+    :param out_features: Output feature dimension.
     :param n_groups: Number of gating groups (ignored when ``gated=False``).
-        ``n_species`` for central-atom conditioning, ``n_species**2`` for
-        per-atom-pair conditioning.
     :param gated: If ``False``, a single shared linear map is used and
-        ``group_idx`` is ignored. If ``True``, an independent weight/bias is
-        selected per row via ``group_idx``.
+        ``group_idx`` is ignored. If ``True``, an independent weight (and bias, if
+        enabled) is selected per row via ``group_idx``.
+    :param bias: Whether to include a learnable bias. Defaults to ``False`` (safe
+        for equivariant models); pass ``True`` for a standard affine linear layer.
     :param chunk_size: When ``gated=True`` and the gather path is taken, the
         per-row weight gather ``weight[group_idx]`` is done in chunks of at most
-        ``chunk_size`` rows (atoms, or NEF-flattened pairs), bounding the
-        materialised ``(chunk_size, out, in)`` gather tensor instead of scaling
-        with the full row count. This is a memory/performance knob only and does
-        not affect results: ``chunk_size >= n_rows`` runs a single gather +
-        matmul (identical to no chunking), while a smaller value trades a short
-        Python loop for a smaller peak memory footprint. Ignored when
-        ``gated=False``.
+        ``chunk_size`` rows, bounding the materialised ``(chunk_size, out, in)``
+        gather tensor instead of scaling with the full row count. This is a
+        memory/performance knob only and does not affect results:
+        ``chunk_size >= n_rows`` runs a single gather + matmul (identical to no
+        chunking), while a smaller value trades a short Python loop for a smaller
+        peak memory footprint. Ignored when ``gated=False``.
     :param sorted_min_rows: Minimum number of rows for the grouped-matmul path
         (see :meth:`forward`). Below it, the sort and its device-to-host
         synchronisation cost more than the weight traffic they save.
@@ -58,6 +61,7 @@ class LinearReadout(torch.nn.Module):
     n_groups: int
     sorted_min_rows: int
     sorted_min_rows_per_group: int
+    bias: Optional[torch.Tensor]
 
     def __init__(
         self,
@@ -65,6 +69,7 @@ class LinearReadout(torch.nn.Module):
         out_features: int,
         n_groups: int,
         gated: bool,
+        bias: bool = False,
         chunk_size: int = 1024,
         sorted_min_rows: int = 8192,
         sorted_min_rows_per_group: int = 128,
@@ -80,10 +85,8 @@ class LinearReadout(torch.nn.Module):
 
         if gated:
             weight = torch.empty(n_groups, out_features, in_features)
-            bias = torch.empty(n_groups, out_features)
         else:
             weight = torch.empty(out_features, in_features)
-            bias = torch.empty(out_features)
         # Match torch.nn.Linear's default initialisation. On the gated 3-D weight
         # this has to be done one group at a time: kaiming_uniform_ would read
         # fan_in = out_features * in_features from the full tensor instead of
@@ -93,17 +96,25 @@ class LinearReadout(torch.nn.Module):
                 torch.nn.init.kaiming_uniform_(weight[group], a=math.sqrt(5))
         else:
             torch.nn.init.kaiming_uniform_(weight, a=math.sqrt(5))
-        bound = 1.0 / math.sqrt(in_features) if in_features > 0 else 0.0
-        torch.nn.init.uniform_(bias, -bound, bound)
         self.weight = torch.nn.Parameter(weight)
-        self.bias = torch.nn.Parameter(bias)
+
+        if bias:
+            if gated:
+                bias_tensor = torch.empty(n_groups, out_features)
+            else:
+                bias_tensor = torch.empty(out_features)
+            bound = 1.0 / math.sqrt(in_features) if in_features > 0 else 0.0
+            torch.nn.init.uniform_(bias_tensor, -bound, bound)
+            self.bias = torch.nn.Parameter(bias_tensor)
+        else:
+            self.register_parameter("bias", None)
 
     def forward(
         self, features: torch.Tensor, group_idx: torch.Tensor
     ) -> torch.Tensor:
         """
-        :param features: ``(n, in_features)`` (node features, or flattened
-            per-atom-pair features), or ``(n, n_neighbours, in_features)`` (edge
+        :param features: ``(n, in_features)`` (e.g. node features, or flattened
+            per-atom-pair features), or ``(n, n_columns, in_features)`` (e.g. edge
             features).
         :param group_idx: Long tensor of shape ``(n,)`` selecting the gating
             group for each row of ``features`` (ignored when ``gated=False``).
@@ -113,8 +124,8 @@ class LinearReadout(torch.nn.Module):
         if not self.gated:
             return torch.nn.functional.linear(features, self.weight, self.bias)
 
-        # Gated: apply a per-row (out, in) weight and (out,) bias. Promote 2-D
-        # features to 3-D so both the node and edge cases are handled uniformly.
+        # Gated: apply a per-row (out, in) weight (and bias). Promote 2-D features
+        # to 3-D so both the node and edge cases are handled uniformly.
         is_2d = features.dim() == 2
         if is_2d:
             features = features.unsqueeze(1)  # (n, 1, in)
@@ -164,6 +175,7 @@ class LinearReadout(torch.nn.Module):
             dtype=features.dtype,
             device=features.device,
         )
+        bias = self.bias
         chunk = self.chunk_size
         n_chunks = (n_rows + chunk - 1) // chunk
         for ci in range(n_chunks):
@@ -171,11 +183,10 @@ class LinearReadout(torch.nn.Module):
             end = min(start + chunk, n_rows)
             idx = group_idx[start:end]
             w = self.weight[idx]  # (chunk, out, in)
-            b = self.bias[idx]  # (chunk, out)
-            out[start:end] = (
-                torch.matmul(features[start:end], w.transpose(-2, -1))
-                + b.unsqueeze(1)
-            )
+            chunk_out = torch.matmul(features[start:end], w.transpose(-2, -1))
+            if bias is not None:
+                chunk_out = chunk_out + bias[idx].unsqueeze(1)
+            out[start:end] = chunk_out
         return out
 
     def _forward_sorted(
@@ -202,41 +213,47 @@ class LinearReadout(torch.nn.Module):
             dtype=features.dtype,
             device=features.device,
         )
+        bias = self.bias
         start = 0
         for group in range(self.n_groups):
             count = counts[group]
             if count > 0:
+                bias_group: Optional[torch.Tensor] = None
+                if bias is not None:
+                    bias_group = bias[group]
                 out[start : start + count] = torch.nn.functional.linear(
                     sorted_features[start : start + count],
                     self.weight[group],
-                    self.bias[group],
+                    bias_group,
                 )
             start += count
         return out.index_select(0, torch.argsort(order))
 
 
 class MoEReadout(torch.nn.Module):
-    """Mixture-of-experts linear readout, routed by an atom-type embedding.
+    """Mixture-of-experts linear readout, routed by a group-index embedding.
 
     A pool of ``num_experts`` linear experts, split into ``num_routed_experts``
     routed experts and ``num_experts - num_routed_experts`` shared experts. For
-    each atom the router (a small central-atom-type embedding) produces softmax
-    scores over the routed experts; the top-``num_topk_experts`` are kept
-    (sparse gating) and combined with their routing weights. Shared experts are
-    always active with unit weight. Conditioning is on the central-atom type
-    only, so this is intended for per-atom (or per-atom-derived) targets.
+    each row the router (a small group-index embedding) produces softmax scores
+    over the routed experts; the top-``num_topk_experts`` are kept (sparse gating)
+    and combined with their routing weights. Shared experts are always active with
+    unit weight. Conditioning is on the group index only (e.g. the central-atom
+    type), so this is intended for per-row (e.g. per-atom) targets.
 
-    All routed experts are evaluated for every atom and then masked by the
-    sparse routing weights; this keeps the module free of data-dependent control
-    flow (TorchScript-friendly). Zero-weighted experts receive no gradient.
+    All routed experts are evaluated for every row and then masked by the sparse
+    routing weights; this keeps the module free of data-dependent control flow
+    (TorchScript-friendly). Zero-weighted experts receive no gradient.
 
-    :param in_features: Input (head) feature dimension.
-    :param out_features: Output feature dimension for the block.
-    :param n_species: Number of distinct atomic species.
+    :param in_features: Input feature dimension.
+    :param out_features: Output feature dimension.
+    :param n_species: Number of distinct group indices (e.g. atomic species).
     :param num_experts: Total number of experts N (>= 1).
-    :param num_routed_experts: Number of Z-gated (routed) experts I (1 <= I <= N).
-    :param num_topk_experts: Routed experts kept per atom via TopK (1 <= K' <= I).
-    :param embedding_dim: Latent dimension of the species router embedding.
+    :param num_routed_experts: Number of gated (routed) experts I (1 <= I <= N).
+    :param num_topk_experts: Routed experts kept per row via TopK (1 <= K' <= I).
+    :param bias: Whether the expert linear maps include a learnable bias. Defaults
+        to ``False`` (safe for equivariant models).
+    :param embedding_dim: Latent dimension of the group-index router embedding.
     """
 
     num_topk: int
@@ -249,6 +266,7 @@ class MoEReadout(torch.nn.Module):
         num_experts: int,
         num_routed_experts: int,
         num_topk_experts: int,
+        bias: bool = False,
         embedding_dim: int = 16,
     ) -> None:
         super().__init__()
@@ -282,13 +300,13 @@ class MoEReadout(torch.nn.Module):
         # Experts are plain (ungated) linear readouts.
         self.routed_experts = torch.nn.ModuleList(
             [
-                LinearReadout(in_features, out_features, 1, gated=False)
+                LinearReadout(in_features, out_features, 1, gated=False, bias=bias)
                 for _ in range(num_routed_experts)
             ]
         )
         self.shared_experts = torch.nn.ModuleList(
             [
-                LinearReadout(in_features, out_features, 1, gated=False)
+                LinearReadout(in_features, out_features, 1, gated=False, bias=bias)
                 for _ in range(num_shared_experts)
             ]
         )
@@ -300,7 +318,7 @@ class MoEReadout(torch.nn.Module):
         :param features: ``(n_atoms, in_features)`` or
             ``(n_atoms, n_neighbours, in_features)``.
         :param species_idx: Long tensor of shape ``(n_atoms,)`` with the
-            central-atom species index.
+            group (e.g. central-atom species) index.
         :return: Same leading dims as ``features`` with last dim ``out_features``.
         """
         # Routing: per-atom sparse gating weights over the routed experts.

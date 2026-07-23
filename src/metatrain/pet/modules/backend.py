@@ -3,9 +3,10 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 
+from metatrain.utils.readout import LinearReadout, MoEReadout
+
 from ..documentation import ModelHypers
 from .conditioning import SystemConditioningEmbedding
-from .readouts import LinearReadout, MoEReadout
 from .structures import compute_batch_tensors
 from .transformer import CartesianTransformer
 
@@ -381,7 +382,7 @@ class PETBackend(torch.nn.Module):
         hypers = readout_spec.get("hypers", {})
 
         if not gating:
-            return LinearReadout(in_features, out_features, 1, gated=False)
+            return LinearReadout(in_features, out_features, 1, gated=False, bias=True)
 
         if gating == "one-hot":
             n_groups = (
@@ -394,6 +395,7 @@ class PETBackend(torch.nn.Module):
                 out_features,
                 n_groups,
                 gated=True,
+                bias=True,
                 chunk_size=hypers.get("chunk_size", 1024),
             )
 
@@ -410,6 +412,7 @@ class PETBackend(torch.nn.Module):
                 num_experts=hypers["num_experts"],
                 num_routed_experts=hypers["num_routed_experts"],
                 num_topk_experts=hypers["num_topk_experts"],
+                bias=True,
                 embedding_dim=hypers.get("embedding_dim", 16),
             )
 
