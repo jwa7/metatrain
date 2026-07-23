@@ -394,7 +394,7 @@ class PETBackend(torch.nn.Module):
                 out_features,
                 n_groups,
                 gated=True,
-                chunk_size=hypers.get("chunk_size", 128),
+                chunk_size=hypers.get("chunk_size", 1024),
             )
 
         if gating == "moe":

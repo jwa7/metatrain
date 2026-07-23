@@ -34,18 +34,30 @@ class LinearReadout(torch.nn.Module):
     :param gated: If ``False``, a single shared linear map is used and
         ``group_idx`` is ignored. If ``True``, an independent weight/bias is
         selected per row via ``group_idx``.
-    :param chunk_size: When ``gated=True``, the per-row weight gather
-        ``weight[group_idx]`` is done in chunks of at most ``chunk_size`` rows
-        (atoms, or NEF-flattened pairs), bounding the materialised
-        ``(chunk_size, out, in)`` gather tensor instead of scaling with the full
-        row count. This is a memory/performance knob only and does not affect
-        results: ``chunk_size >= n_rows`` runs a single gather + matmul (identical
-        to no chunking), while a smaller value trades a short Python loop for a
-        smaller peak memory footprint. Ignored when ``gated=False``.
+    :param chunk_size: When ``gated=True`` and the gather path is taken, the
+        per-row weight gather ``weight[group_idx]`` is done in chunks of at most
+        ``chunk_size`` rows (atoms, or NEF-flattened pairs), bounding the
+        materialised ``(chunk_size, out, in)`` gather tensor instead of scaling
+        with the full row count. This is a memory/performance knob only and does
+        not affect results: ``chunk_size >= n_rows`` runs a single gather +
+        matmul (identical to no chunking), while a smaller value trades a short
+        Python loop for a smaller peak memory footprint. Ignored when
+        ``gated=False``.
+    :param sorted_min_rows: Minimum number of rows for the grouped-matmul path
+        (see :meth:`forward`). Below it, the sort and its device-to-host
+        synchronisation cost more than the weight traffic they save.
+    :param sorted_min_rows_per_group: Minimum average number of rows per group
+        (``n_rows / n_groups``) for the grouped-matmul path. Below it, the
+        per-group matmuls are too small to amortise the Python loop over the
+        groups. Both thresholds are performance knobs only; the two paths give
+        identical results.
     """
 
     gated: bool
     chunk_size: int
+    n_groups: int
+    sorted_min_rows: int
+    sorted_min_rows_per_group: int
 
     def __init__(
         self,
@@ -53,11 +65,16 @@ class LinearReadout(torch.nn.Module):
         out_features: int,
         n_groups: int,
         gated: bool,
-        chunk_size: int = 128,
+        chunk_size: int = 1024,
+        sorted_min_rows: int = 8192,
+        sorted_min_rows_per_group: int = 128,
     ) -> None:
         super().__init__()
         self.gated = gated
         self.chunk_size = chunk_size
+        self.n_groups = n_groups
+        self.sorted_min_rows = sorted_min_rows
+        self.sorted_min_rows_per_group = sorted_min_rows_per_group
         self.in_features = in_features
         self.out_features = out_features
 
@@ -67,8 +84,15 @@ class LinearReadout(torch.nn.Module):
         else:
             weight = torch.empty(out_features, in_features)
             bias = torch.empty(out_features)
-        # Match torch.nn.Linear's default initialisation.
-        torch.nn.init.kaiming_uniform_(weight, a=math.sqrt(5))
+        # Match torch.nn.Linear's default initialisation. On the gated 3-D weight
+        # this has to be done one group at a time: kaiming_uniform_ would read
+        # fan_in = out_features * in_features from the full tensor instead of
+        # in_features, shrinking the initial scale by ~sqrt(out_features).
+        if gated:
+            for group in range(n_groups):
+                torch.nn.init.kaiming_uniform_(weight[group], a=math.sqrt(5))
+        else:
+            torch.nn.init.kaiming_uniform_(weight, a=math.sqrt(5))
         bound = 1.0 / math.sqrt(in_features) if in_features > 0 else 0.0
         torch.nn.init.uniform_(bias, -bound, bound)
         self.weight = torch.nn.Parameter(weight)
@@ -89,18 +113,49 @@ class LinearReadout(torch.nn.Module):
         if not self.gated:
             return torch.nn.functional.linear(features, self.weight, self.bias)
 
-        # Gated: select a per-row (out, in) weight and (out,) bias, indexed
-        # along dim 0. Promote 2-D features to 3-D so a single batched matmul
-        # handles both the node and edge cases uniformly.
+        # Gated: apply a per-row (out, in) weight and (out,) bias. Promote 2-D
+        # features to 3-D so both the node and edge cases are handled uniformly.
         is_2d = features.dim() == 2
         if is_2d:
             features = features.unsqueeze(1)  # (n, 1, in)
 
-        # The gather ``weight[group_idx]`` materialises an ``(n_rows, out, in)`` tensor,
-        # which can be large. Process the rows in chunks of at most ``chunk_size`` so
-        # only ``(chunk_size, out, in)`` is materialised at a time. ``chunk_size >=
-        # n_rows`` runs a single chunk, i.e. the plain batched gather + matmul; the
-        # result is identical either way.
+        # Two paths compute the same thing but move very different amounts of
+        # weight memory. The gather path copies a weight matrix per row, i.e.
+        # n_rows * out * in of traffic; the grouped path sorts the rows and reads
+        # each of the n_groups matrices once. Sorting only pays off with enough
+        # rows in total (it costs a device-to-host sync) and enough rows per group
+        # (each group is one matmul in a Python loop), which is exactly the
+        # central-atom conditioning regime; per-atom-pair conditioning has
+        # n_species**2 groups and lands on the gather path.
+        n_rows = features.shape[0]
+        use_sorted = (
+            n_rows >= self.sorted_min_rows
+            and n_rows >= self.sorted_min_rows_per_group * self.n_groups
+        )
+        if use_sorted:
+            out = self._forward_sorted(features, group_idx)
+        else:
+            out = self._forward_gathered(features, group_idx)
+
+        if is_2d:
+            out = out.squeeze(1)
+        return out
+
+    def _forward_gathered(
+        self, features: torch.Tensor, group_idx: torch.Tensor
+    ) -> torch.Tensor:
+        """Gather a weight per row and batch-matmul, in chunks of rows.
+
+        The gather ``weight[group_idx]`` materialises an ``(n_rows, out, in)``
+        tensor, which can be large. Processing the rows in chunks of at most
+        ``chunk_size`` materialises only ``(chunk_size, out, in)`` at a time;
+        ``chunk_size >= n_rows`` runs a single chunk, i.e. the plain batched
+        gather + matmul.
+
+        :param features: ``(n_rows, n_columns, in_features)`` features.
+        :param group_idx: Long tensor of shape ``(n_rows,)``.
+        :return: ``(n_rows, n_columns, out_features)`` outputs.
+        """
         n_rows = features.shape[0]
         out = torch.empty(
             n_rows,
@@ -121,9 +176,43 @@ class LinearReadout(torch.nn.Module):
                 torch.matmul(features[start:end], w.transpose(-2, -1))
                 + b.unsqueeze(1)
             )
-        if is_2d:
-            out = out.squeeze(1)
         return out
+
+    def _forward_sorted(
+        self, features: torch.Tensor, group_idx: torch.Tensor
+    ) -> torch.Tensor:
+        """Sort the rows by group and run one dense linear per non-empty group.
+
+        Each weight matrix is read once instead of being copied per row, and the
+        work runs as a few large matmuls rather than many single-row ones.
+
+        :param features: ``(n_rows, n_columns, in_features)`` features.
+        :param group_idx: Long tensor of shape ``(n_rows,)``.
+        :return: ``(n_rows, n_columns, out_features)`` outputs, in the original
+            row order.
+        """
+        order = torch.argsort(group_idx)
+        counts: List[int] = torch.bincount(group_idx, minlength=self.n_groups).tolist()
+        sorted_features = features.index_select(0, order)
+
+        out = torch.empty(
+            features.shape[0],
+            features.shape[1],
+            self.out_features,
+            dtype=features.dtype,
+            device=features.device,
+        )
+        start = 0
+        for group in range(self.n_groups):
+            count = counts[group]
+            if count > 0:
+                out[start : start + count] = torch.nn.functional.linear(
+                    sorted_features[start : start + count],
+                    self.weight[group],
+                    self.bias[group],
+                )
+            start += count
+        return out.index_select(0, torch.argsort(order))
 
 
 class MoEReadout(torch.nn.Module):

@@ -292,7 +292,7 @@ class ModelHypers(TypedDict):
     index ``Z_I * n_species + Z_J`` (``n_species**2`` weight matrices), giving full
     center/neighbour pair conditioning.
     
-    The optional ``hypers.chunk_size`` (default ``128``) fixes the size of the sample
+    The optional ``hypers.chunk_size`` (default ``1024``) fixes the size of the sample
     dimension when doing a batched matrix multiplication of the readout weights with the
     head features, which can reduce memory usage for large systems. This doesn't affect
     results, but may affect speed and memory consumption.
@@ -301,7 +301,7 @@ class ModelHypers(TypedDict):
 
         readout_type:
           atom_type_gating: one-hot hypers:
-            chunk_size: 128   # optional, default 128
+            chunk_size: 1024   # optional, default 1024
 
     ``{atom_type_gating: "moe", hypers: {...}}``: a mixture-of-experts linear readout
     whose experts are gated by routing weights from a learned embedding of the
