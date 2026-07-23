@@ -140,7 +140,7 @@ important** (in decreasing order of importance):
       :no-index:
 """
 
-from typing import Literal, Optional
+from typing import Any, Dict, Literal, Optional, Union
 
 from typing_extensions import TypedDict
 
@@ -199,8 +199,42 @@ class ModelHypers(TypedDict):
     increasing it might lead to better accuracy, especially on larger datasets, at the
     cost of increased training and evaluation time.
     """
-    d_head: int = 128
-    """Dimension of the attention heads."""
+    d_head: Union[int, Dict[str, int]] = 128
+    """Output dimension of the node/edge heads.
+
+    Either a single ``int`` (the same head dimension for both the node and edge
+    heads) or a dict ``{node: int, edge: int}`` to set the node and edge head
+    dimensions independently. See :attr:`head_type` and :attr:`num_head_layers`.
+    """
+    head_type: Union[
+        Literal["per_target", "per_block"],
+        Dict[str, Literal["per_target", "per_block"]],
+    ] = "per_target"
+    """How the node/edge heads are defined.
+
+    ``"per_target"`` (default): a single node head and a single edge head are
+    defined per target, mapping the backbone features to ``d_head`` and shared
+    across all of that target's sparse blocks. This reproduces the standard PET
+    behaviour.
+
+    ``"per_block"``: a separate node/edge head is defined for *each sparse
+    block* of each target, so every block can filter the backbone features for
+    its own symmetry independently. With an asymmetric :attr:`d_head`
+    (``node`` != ``edge``), the last-layer features concatenated per block will
+    therefore have a different total dimension than in the ``"per_target"`` case.
+
+    This may also be set *per target* by passing a dict keyed by target name
+    (similar to the ``loss`` option), e.g. ``{"mtt::foo": "per_block"}``. A bare
+    value applies to all targets; with a dict, any target not listed falls back
+    to the default ``"per_target"``.
+    """
+    num_head_layers: int = 2
+    """Number of Linear+SiLU layers in each node/edge head MLP. Must be ``>= 1``.
+
+    Each head maps ``d_node`` → ``d_head`` (nodes) or ``d_pet`` → ``d_head``
+    (edges) via ``num_head_layers`` linear layers with SiLU activations, before
+    the (linear) readout. See :attr:`head_type` and :attr:`d_head`.
+    """
     d_node: int = 256
     """Dimension of the node features.
 
@@ -241,6 +275,60 @@ class ModelHypers(TypedDict):
     Additionally, the feedforward version uses bidirectional features flow during the
     message passing iterations, that favors features flowing from atom ``i`` to atom
     ``j`` to be not equal to the features flowing from atom ``j`` to atom ``i``."""
+    readout_type: Dict[str, Any] = {"atom_type_gating": False, "hypers": {}}
+    """Atom-type gating of the (linear) readout / last layers.
+
+    The readout is a strictly *linear* map from the head dimension to each block's
+    output dimension; all nonlinearity lives in the heads (see :attr:`head_type`). This
+    hyper controls optional atom-type conditioning of that linear map, and applies to
+    *all* target kinds (per-atom, per-atom-pair and per-structure).
+
+    ``{atom_type_gating: false}`` (default): a single shared linear readout per block,
+    with no atom-type conditioning (the vanilla PET readout).
+
+    ``{atom_type_gating: "one-hot"}``: an independent linear readout per atom type.
+    Per-atom (and per-structure) contributions are indexed by the central-atom type
+    (``n_species`` weight matrices); per-atom-pair targets are indexed by the flat pair
+    index ``Z_I * n_species + Z_J`` (``n_species**2`` weight matrices), giving full
+    center/neighbour pair conditioning.
+    
+    The optional ``hypers.chunk_size`` (default ``128``) fixes the size of the sample
+    dimension when doing a batched matrix multiplication of the readout weights with the
+    head features, which can reduce memory usage for large systems. This doesn't affect
+    results, but may affect speed and memory consumption.
+
+    .. code-block:: yaml
+
+        readout_type:
+          atom_type_gating: one-hot hypers:
+            chunk_size: 128   # optional, default 128
+
+    ``{atom_type_gating: "moe", hypers: {...}}``: a mixture-of-experts linear readout
+    whose experts are gated by routing weights from a learned embedding of the
+    central-atom type. Per-atom targets only (not per-atom-pair).
+
+    .. code-block:: yaml
+
+        readout_type:
+          atom_type_gating: moe
+          hypers:
+            num_experts: 5
+            num_routed_experts: 5
+            num_topk_experts: 2
+            embedding_dim: 16   # optional, default 16
+
+    This may also be set *per target* by passing a dict keyed by target name , whose
+    values are the per-target readout specs. A spec containing the ``atom_type_gating``
+    key applies to all targets; otherwise the dict is interpreted as ``{target_name:
+    spec}`` and any target not listed falls back to the default (no gating). For
+    example:
+
+    .. code-block:: yaml
+
+        readout_type:
+          mtt::foo:
+            atom_type_gating: one-hot hypers: {}
+    """
     zbl: bool = False
     """Use ZBL potential for short-range repulsion"""
     long_range: LongRangeHypers = init_with_defaults(LongRangeHypers)

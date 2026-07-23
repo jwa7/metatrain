@@ -88,7 +88,15 @@ class PET(ModelInterface[ModelHypers]):
         self.adaptive_cutoff_method = self.hypers["adaptive_cutoff_method"]
         self.d_pet = self.hypers["d_pet"]
         self.d_node = self.hypers["d_node"]
-        self.d_head = self.hypers["d_head"]
+        # d_head may be a single int (shared node/edge head dim) or a dict
+        # {node: int, edge: int} for independent node/edge head dims.
+        d_head = self.hypers["d_head"]
+        if isinstance(d_head, dict):
+            self.d_head_node = int(d_head["node"])
+            self.d_head_edge = int(d_head["edge"])
+        else:
+            self.d_head_node = int(d_head)
+            self.d_head_edge = int(d_head)
         self.num_gnn_layers = self.hypers["num_gnn_layers"]
         self.featurizer_type = self.hypers["featurizer_type"]
 
@@ -112,9 +120,15 @@ class PET(ModelInterface[ModelHypers]):
         self.backend = PETBackend(self.hypers, self.atomic_types)
         self.num_readout_layers = self.backend.num_readout_layers
         self.system_conditioning = self.backend.system_conditioning
-        self.last_layer_feature_size = (
-            self.num_readout_layers * self.d_head * self.NUM_FEATURE_TYPES
-        )  # for LLPR
+        # For LLPR. With head_type="per_target" the same head output is shared
+        # across a target's blocks, so per readout layer we expose one node
+        # (d_head_node) plus one edge (d_head_edge) feature vector. With
+        # head_type="per_block" the concatenated last-layer feature size is
+        # target-dependent (it scales with the number of blocks); this scalar
+        # reports the per-block value.
+        self.last_layer_feature_size = self.num_readout_layers * (
+            self.d_head_node + self.d_head_edge
+        )
 
         # the model is always capable of outputting the internal features
         self.outputs = {
@@ -799,8 +813,8 @@ class PET(ModelInterface[ModelHypers]):
 
     def _get_output_last_layer_features(
         self,
-        node_last_layer_features_dict: Dict[str, List[torch.Tensor]],
-        edge_last_layer_features_dict: Dict[str, List[torch.Tensor]],
+        node_last_layer_features_dict: Dict[str, List[List[torch.Tensor]]],
+        edge_last_layer_features_dict: Dict[str, List[List[torch.Tensor]]],
         cutoff_factors: torch.Tensor,
         selected_atoms: Optional[Labels],
         sample_labels: Labels,
@@ -810,10 +824,16 @@ class PET(ModelInterface[ModelHypers]):
         Combine node and edge last layer features for requested last layer
         features output. Edge features are summed with cutoff weighting.
 
+        Per readout layer, the node and edge head features are concatenated along
+        the feature dimension. For ``head_type="per_target"`` there is one node
+        and one edge feature per layer; for ``head_type="per_block"`` there is one
+        of each per block (so the concatenated size is larger, and depends on the
+        number of blocks and on ``d_head``).
+
         :param node_last_layer_features_dict: Dictionary mapping output names to
-            lists of node last layer features.
+            per-layer lists of per-block node last layer features.
         :param edge_last_layer_features_dict: Dictionary mapping output names to
-            lists of edge last layer features.
+            per-layer lists of per-block edge last layer features.
         :param cutoff_factors: Tensor of cutoff factors for edge distances
             [n_atoms, max_num_neighbors].
         :param selected_atoms: Optional Labels specifying a subset of atoms to include.
@@ -827,16 +847,20 @@ class PET(ModelInterface[ModelHypers]):
         for output_name in node_last_layer_features_dict.keys():
             if not should_compute_last_layer_features(output_name, requested_outputs):
                 continue
-            if output_name not in last_layer_features_dict:
-                last_layer_features_dict[output_name] = []
-            for i in range(len(node_last_layer_features_dict[output_name])):
-                node_last_layer_features = node_last_layer_features_dict[output_name][i]
-                edge_last_layer_features = edge_last_layer_features_dict[output_name][i]
-                edge_last_layer_features = (
-                    edge_last_layer_features * cutoff_factors[:, :, None]
-                ).sum(dim=1)
-                last_layer_features_dict[output_name].append(node_last_layer_features)
-                last_layer_features_dict[output_name].append(edge_last_layer_features)
+            llf = torch.jit.annotate(List[torch.Tensor], [])
+            node_layers = node_last_layer_features_dict[output_name]
+            edge_layers = edge_last_layer_features_dict[output_name]
+            for i in range(len(node_layers)):
+                node_block_feats = node_layers[i]
+                edge_block_feats = edge_layers[i]
+                for j in range(len(node_block_feats)):
+                    llf.append(node_block_feats[j])
+                for j in range(len(edge_block_feats)):
+                    edge_summed = (
+                        edge_block_feats[j] * cutoff_factors[:, :, None]
+                    ).sum(dim=1)
+                    llf.append(edge_summed)
+            last_layer_features_dict[output_name] = llf
 
         for output_name in requested_outputs:
             if not (
