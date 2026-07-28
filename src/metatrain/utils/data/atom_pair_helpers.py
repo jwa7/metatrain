@@ -193,7 +193,9 @@ def get_single_direction_edges(tmap: TensorMap) -> TensorMap:
         else:
             # Otherwise, get the edges where the first atom index is smaller
             # than the second one.
-            mask = block.samples["first_atom"] < block.samples["second_atom"]
+            mask = block.samples.column("first_atom") < block.samples.column(
+                "second_atom"
+            )
             new_block = TensorBlock(
                 values=block.values[mask],
                 samples=Labels(
@@ -211,9 +213,7 @@ def get_single_direction_edges(tmap: TensorMap) -> TensorMap:
 
     return TensorMap(
         blocks=new_blocks,
-        keys=Labels(
-            names=tmap.keys.names, values=torch.tensor(new_keys, device=tmap.device)
-        ),
+        keys=Labels(names=tmap.keys.names, values=torch.stack(new_keys)),
     )
 
 
@@ -254,8 +254,8 @@ def get_bidirectional_edges(tmap: TensorMap) -> TensorMap:
     cell_shift_b = tmap.block(0).samples.names.index("cell_shift_b")
     cell_shift_c = tmap.block(0).samples.names.index("cell_shift_c")
     i_n1 = tmap.block(0).properties.names.index("n_1")
-    i_n2 = tmap.block(0).properties.names.index("n_2")    
-    i_l1 = i_l2 = i_type1 = i_type2 = 0 # to make torchscript happy.
+    i_n2 = tmap.block(0).properties.names.index("n_2")
+    i_l1 = i_l2 = i_type1 = i_type2 = 0  # to make torchscript happy.
     if is_coupled:
         i_l1 = tmap.block(0).properties.names.index("l_1")
         i_l2 = tmap.block(0).properties.names.index("l_2")
@@ -319,7 +319,9 @@ def get_bidirectional_edges(tmap: TensorMap) -> TensorMap:
         if is_coupled:
             # Also swap l_1 with l_2.
             properties[:, [i_l1, i_l2]] = properties[:, [i_l2, i_l1]]
-            properties_order = torch.arange(properties.shape[0]) # to make torchscript happy.
+            properties_order = torch.arange(
+                properties.shape[0]
+            )  # to make torchscript happy.
         else:
             # Reorder the properties by n_1 and n_2
             properties_order = _lexsort_2col(properties)

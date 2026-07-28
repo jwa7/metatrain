@@ -6,14 +6,12 @@ from featomic.torch.clebsch_gordan._coefficients import (
 )
 from metatensor.torch import Labels, TensorMap
 
-from metatrain.experimental.edge_composition.utils.transforms import (
-    uncouple_tensor_blocks,
-)
 from metatrain.utils.data import DiskDataset
 from metatrain.utils.data.atom_pair_helpers import (
     get_bidirectional_edges,
     get_single_direction_edges,
 )
+from metatrain.utils.data.spherical_helpers import uncouple_tensor_blocks
 
 from ...conftest import RESOURCES_PATH
 
@@ -27,12 +25,14 @@ def batch_size(request):
 def basis(request):
     return request.param
 
+
 def test_jit_script_single_direction():
-    pytest.skip("Converting to single direction edges is not torchscript compatible yet.")
     torch.jit.script(get_single_direction_edges)
+
 
 def test_jit_script_bidirectional():
     torch.jit.script(get_bidirectional_edges)
+
 
 def test_edges_single_bidirectional_roundtrip(batch_size, basis):
     """Tests that the functions to get single direction edges
