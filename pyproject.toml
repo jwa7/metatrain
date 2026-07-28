@@ -99,6 +99,11 @@ lorem = [
     "sphericart-torch>=2.0.3",
     "wigners",
 ]
+edge-composition = [
+    "sphericart-torch",
+    "featomic-torch",
+    "torchcurves >=0.3.0"
+]
 
 # Extras for extenders.
 extender-rename = []

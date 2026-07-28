@@ -8,6 +8,8 @@ from metatensor.torch.operations._add import _add_block_block
 from metatensor.torch.operations._multiply import _multiply_block_constant
 from metatomic.torch import System
 
+from metatrain.experimental.edge_composition.utils.samples import match_samples
+
 from ..data import TargetInfo
 from ..data.dataset import CollateTransform
 from ..data.match_tmaps import match_layout
@@ -19,6 +21,7 @@ def remove_additive(
     targets: Dict[str, TensorMap],
     additive_model: torch.nn.Module,
     target_info_dict: Dict[str, TargetInfo],
+    extra_data: Dict[str, TensorMap] = {},
 ) -> Dict[str, TensorMap]:
     """Remove an additive contribution from the training targets.
 
@@ -74,6 +77,16 @@ def remove_additive(
                     "subtraction of additive contributions must happen in the "
                     "same layout."
                 )
+
+    atom_pair_contribs = {
+        key: v
+        for key, v in additive_contribution.items()
+        if target_info_dict[key].sample_kind == "atom_pair"
+    }
+
+    additive_contribution.update(
+        match_samples(atom_pair_contribs, targets, extra_data, which_samples="targets")
+    )
 
     for target_key in additive_contribution.keys():
         # note that we loop over the keys of additive_contribution, not targets,
@@ -184,10 +197,7 @@ def get_remove_additive_transform(
         """
         for additive_model in additive_models:
             targets = remove_additive(
-                systems,
-                targets,
-                additive_model,
-                target_info_dict,
+                systems, targets, additive_model, target_info_dict, extra_data=extra
             )
         return systems, targets, extra
 
