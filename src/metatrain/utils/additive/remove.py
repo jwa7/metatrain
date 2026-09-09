@@ -12,6 +12,8 @@ from metatrain.experimental.edge_composition import EdgeCompositionModel
 from metatrain.experimental.edge_composition.utils.samples import match_samples
 
 from ..data import TargetInfo
+from ..data.atom_pair_helpers import expand_masked_atom_pair_samples
+from ..data.atomic_basis_helpers import densify_atomic_basis_target
 from ..evaluate_model import evaluate_model
 
 
@@ -66,6 +68,37 @@ def remove_additive(
         for key, v in additive_contribution.items()
         if target_info_dict[key].sample_kind == "atom_pair"
     }
+
+    for key, contribution in atom_pair_contribs.items():
+        # Restore any samples/blocks dropped by EdgeCompositionModel's own
+        # upper-triangular masking (same-atom-type-pair samples, and entire
+        # missing cross-type-ordered blocks alike), to avoid redundantly
+        # fitting a quantity related to its own reverse by a known symmetry -
+        # see `expand_masked_atom_pair_samples`. Must happen before the
+        # possible densification below, since it needs the sparse,
+        # "first_atom_type"/"second_atom_type"-keyed representation. A no-op
+        # for any contribution this doesn't apply to.
+        contribution = expand_masked_atom_pair_samples(contribution)
+
+        # Some architectures (e.g. PET) densify atom-pair targets - moving the
+        # "first_atom_type"/"second_atom_type" key dimensions to the samples, see
+        # `atomic_basis_helpers.densify_atomic_basis_target` - before this point,
+        # while an additive model's own eval-mode contribution for such a target
+        # (e.g. `EdgeCompositionModel`, forced into eval mode above) stays in its
+        # natural sparse, atom-type-keyed form. `match_samples` only matches by exact
+        # block key, so left alone this silently matches nothing (falling back to its
+        # own all-zero/empty block for every key) rather than raising - the
+        # contribution would never actually be removed. Reconcile by densifying the
+        # sparse contribution to the target's own representation first, whenever the
+        # two differ; left untouched when both are already sparse (e.g. `graph2mat`,
+        # which never densifies atom-pair targets in the first place).
+        target_is_dense = "first_atom_type" not in targets[key].keys.names
+        contribution_is_sparse = "first_atom_type" in contribution.keys.names
+        if target_is_dense and contribution_is_sparse:
+            contribution = densify_atomic_basis_target(
+                contribution, target_info_dict[key].layout, fill_value=0.0
+            )
+        atom_pair_contribs[key] = contribution
 
     additive_contribution.update(
         match_samples(atom_pair_contribs, targets, extra_data, which_samples="targets")

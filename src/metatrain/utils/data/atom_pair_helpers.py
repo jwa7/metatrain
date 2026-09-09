@@ -533,3 +533,195 @@ def _pair_arrays_from_neighbor_lists(
     neighbors = neighbors + edge_offsets
 
     return centers, neighbors, cell_shifts
+
+
+def _copy_block(block: TensorBlock) -> TensorBlock:
+    return TensorBlock(
+        values=block.values,
+        samples=block.samples,
+        components=block.components,
+        properties=block.properties,
+    )
+
+
+def _lexsort_2col(values: torch.Tensor) -> torch.Tensor:
+    """Argsort of a two-column int tensor, primarily by column 0 then column 1.
+    Rows (property labels) are always unique, so no tie-breaking is needed."""
+    if values.shape[0] == 0:
+        return torch.arange(0)
+    multiplier = int(values[:, 1].max().item()) + 1
+    combined = values[:, 0].to(torch.int64) * multiplier + values[:, 1].to(torch.int64)
+    return torch.argsort(combined)
+
+
+def _reversed_atom_pair_block(
+    block: TensorBlock,
+    i_first: int,
+    i_second: int,
+    i_shift_a: int,
+    i_shift_b: int,
+    i_shift_c: int,
+) -> TensorBlock:
+    """Swap "first"/"second" atom throughout ``block``: negate the cell shift and
+    swap ``first_atom``/``second_atom`` in the samples, transpose the two component
+    axes, and re-sort the properties after swapping ``n_1``/``n_2`` (their swapped
+    order isn't itself ascending)."""
+    reversed_samples_values = block.samples.values.clone()
+    reversed_samples_values[:, [i_first, i_second]] = reversed_samples_values[
+        :, [i_second, i_first]
+    ]
+    reversed_samples_values[:, [i_shift_a, i_shift_b, i_shift_c]] *= -1
+    reversed_samples = Labels(
+        names=block.samples.names, values=reversed_samples_values
+    )
+
+    reversed_values = block.values.transpose(1, 2)
+    # The component axes themselves were just swapped along with the values
+    # (o3_mu_1 <-> o3_mu_2): axis 0 must always be named "o3_mu_1" and axis 1
+    # "o3_mu_2" regardless of content, so re-tag (not just reorder) the two
+    # component Labels rather than swapping the list order outright - which
+    # would leave axis 0 named "o3_mu_2" whenever o3_lambda_1 != o3_lambda_2.
+    reversed_components = [
+        Labels(names=block.components[0].names, values=block.components[1].values),
+        Labels(names=block.components[1].names, values=block.components[0].values),
+    ]
+
+    swapped_properties_values = block.properties.values[:, [1, 0]]
+    order = _lexsort_2col(swapped_properties_values)
+    reversed_properties = Labels(
+        names=block.properties.names, values=swapped_properties_values[order]
+    )
+    reversed_values = reversed_values.index_select(-1, order)
+
+    return TensorBlock(
+        values=reversed_values,
+        samples=reversed_samples,
+        components=reversed_components,
+        properties=reversed_properties,
+    )
+
+
+def expand_masked_atom_pair_samples(tmap: TensorMap) -> TensorMap:
+    """
+    Restores atom-pair data dropped by :class:`~metatrain.experimental
+    .edge_composition.EdgeCompositionModel`'s upper-triangular masking in the
+    uncoupled basis: within a same-atom-type-pair block, only the
+    ``first_atom < second_atom`` samples are kept; for a cross-type pair, only
+    one of the two type-ordered keys is produced at all (e.g. only H-O, not O-H).
+
+    Both are the same symmetry: swapping "first"/"second" atom is equivalent to
+    transposing the two component axes and swapping the ``n_1``/``n_2`` property
+    axes of the *sibling* block (``o3_lambda_1``/``_2``, ``o3_sigma_1``/``_2`` and
+    the two atom types all swapped) - applied at whichever granularity is
+    missing, samples or the whole block. Verified exactly against real reference
+    data, no extra sign. A tensor with neither form of masking passes through
+    unchanged.
+
+    Only the uncoupled basis is affected - the coupled basis already folds both
+    directions into one block per unordered type pair (see
+    :func:`get_bidirectional_edges`).
+
+    :param tmap: An atom-pair TensorMap in the uncoupled basis
+        (``"o3_lambda_1"``/``"o3_lambda_2"`` present in the keys).
+    :return: ``tmap`` with masked same-type samples and missing cross-type keys
+        restored; unchanged if neither form of masking applies.
+    """
+    key_names = tmap.keys.names
+    if "first_atom_type" not in key_names or "second_atom_type" not in key_names:
+        # Not an atom-pair tensor at all (e.g. a per-atom additive contribution) -
+        # nothing to do.
+        return tmap
+    if "o3_lambda_1" not in key_names or "o3_lambda_2" not in key_names:
+        # Coupled basis (or something else entirely) - not handled here, see
+        # `get_bidirectional_edges` for the coupled case.
+        return tmap
+
+    i_z1 = key_names.index("first_atom_type")
+    i_z2 = key_names.index("second_atom_type")
+    i_l1 = key_names.index("o3_lambda_1")
+    i_l2 = key_names.index("o3_lambda_2")
+    i_s1 = key_names.index("o3_sigma_1")
+    i_s2 = key_names.index("o3_sigma_2")
+
+    i_first = tmap.block(0).samples.names.index("first_atom")
+    i_second = tmap.block(0).samples.names.index("second_atom")
+    i_shift_a = tmap.block(0).samples.names.index("cell_shift_a")
+    i_shift_b = tmap.block(0).samples.names.index("cell_shift_b")
+    i_shift_c = tmap.block(0).samples.names.index("cell_shift_c")
+
+    new_keys_values: List[List[int]] = []
+    new_blocks: List[TensorBlock] = []
+    for key, block in tmap.items():
+        key_values: List[int] = key.values.to(torch.int64).tolist()
+        z1 = key_values[i_z1]
+        z2 = key_values[i_z2]
+
+        sibling_values: List[int] = key_values[:]
+        sibling_values[i_l1] = key_values[i_l2]
+        sibling_values[i_l2] = key_values[i_l1]
+        sibling_values[i_s1] = key_values[i_s2]
+        sibling_values[i_s2] = key_values[i_s1]
+        sibling_values[i_z1] = key_values[i_z2]
+        sibling_values[i_z2] = key_values[i_z1]
+
+        sibling_pos: Optional[int] = tmap.keys.position(sibling_values)
+
+        if z1 == z2:
+            if sibling_pos is None:
+                # No counterpart at all for this same-type key (e.g. no such
+                # pairs occur in these systems in the first place) - nothing
+                # to restore.
+                new_keys_values.append(key_values)
+                new_blocks.append(_copy_block(block))
+            else:
+                # Restore this block's missing first_atom > second_atom
+                # samples using the sibling's first_atom < second_atom ones
+                # (the sibling is this same block itself when o3_lambda_1 ==
+                # o3_lambda_2 and o3_sigma_1 == o3_sigma_2).
+                sibling_block = tmap.block_by_id(sibling_pos)
+                reversed_sibling = _reversed_atom_pair_block(
+                    sibling_block, i_first, i_second, i_shift_a, i_shift_b, i_shift_c
+                )
+                full_samples = Labels(
+                    names=block.samples.names,
+                    values=torch.concatenate(
+                        [block.samples.values, reversed_sibling.samples.values],
+                        dim=0,
+                    ),
+                )
+                full_values = torch.concatenate(
+                    [block.values, reversed_sibling.values], dim=0
+                )
+                new_keys_values.append(key_values)
+                new_blocks.append(
+                    TensorBlock(
+                        values=full_values,
+                        samples=full_samples,
+                        components=block.components,
+                        properties=block.properties,
+                    )
+                )
+        else:
+            new_keys_values.append(key_values)
+            new_blocks.append(_copy_block(block))
+            if sibling_pos is None:
+                # The reverse-type-ordered key is entirely missing - this is
+                # the only direction present for this pair of types, so
+                # synthesize the missing sibling block wholesale from it.
+                new_keys_values.append(sibling_values)
+                new_blocks.append(
+                    _reversed_atom_pair_block(
+                        block, i_first, i_second, i_shift_a, i_shift_b, i_shift_c
+                    )
+                )
+            # else: both directions are already present as separate,
+            # presumably already-complete blocks (e.g. a `graph2mat`-style
+            # additive model that never masks cross-type pairs) - leave both
+            # unchanged; the sibling key will be visited on its own turn in
+            # this same loop.
+
+    new_keys = Labels(
+        names=key_names,
+        values=torch.tensor(new_keys_values, dtype=tmap.keys.values.dtype),
+    )
+    return TensorMap(keys=new_keys, blocks=new_blocks)

@@ -96,7 +96,8 @@ dpa3 = [
 ]
 edge-composition = [
     "sphericart-torch",
-    "featomic-torch"
+    "featomic-torch",
+    "torchcurves >=0.3.0",  # radial basis functions (BSpline)
 ]
 
 [tool.check-manifest]

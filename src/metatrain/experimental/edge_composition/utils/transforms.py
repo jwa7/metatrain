@@ -129,29 +129,15 @@ def couple_tensor_blocks(
 
 def _uncouple_tensor_blocks(
     tensor: TensorMap,
-    cg_coeffs: Optional[TensorMap] = None,
+    cg_coeffs: TensorMap,
 ) -> TensorMap:
     """
     Takes the coupled block representation of a per-pair target property on an
     atom-centered basis and uncouples the blocks.
 
-    Copied from elearn
+    Copied from elearn. ``cg_coeffs`` is required: the lazy-default branch this
+    used to have was dead code and not TorchScript-scriptable, breaking export.
     """
-
-    # Compute CG coefficients if not passed
-    # TODO: fix the case of sparse CG coefficients
-    # cg_backend = "python-sparse" if backend == "numpy" else "python-dense"
-    cg_backend = "python-dense"
-    if cg_coeffs is None:
-        max_angular = int(torch.max(tensor.keys.column("o3_lambda")))
-        cg_coeffs = calculate_cg_coefficients(
-            max_angular * 2,
-            cg_backend=cg_backend,
-            arrays_backend="torch",
-            dtype=tensor[0].values.dtype,
-            device=tensor[0].values.device,
-        )
-
     # Check key names
     assert tensor.keys.names[:2] == ["o3_lambda", "o3_sigma"]
     is_symmetrized = "s2_pi" in tensor.keys.names
@@ -161,9 +147,14 @@ def _uncouple_tensor_blocks(
         key_names += ["s2_pi"]
     key_names += ["first_atom_type", "second_atom_type", "n_1", "n_2"]
 
-    # Uncouple each block in turn
-    samples: dict[tuple[int, ...], list[torch.Tensor]] = {}
-    values: dict[tuple[int, ...], list[torch.Tensor]] = {}
+    # Uncouple each block in turn. Dict keys are encoded as a single string (rather
+    # than the variable-length tuple used previously) since TorchScript requires
+    # concrete, fixed-arity tuple types (no `Tuple[int, ...]`) and does not support
+    # tuples as Dict keys at all - str/int/float/bool/Tensor only.
+    sample_labels: dict[str, Labels] = {}
+    key_ints: dict[str, list[int]] = {}
+    values: dict[str, torch.Tensor] = {}
+    key_order: list[str] = []
     for k, b in tensor.items():
         b_samples = b.samples
         b_values = b.values
@@ -171,19 +162,25 @@ def _uncouple_tensor_blocks(
         o3_lambda = int(k["o3_lambda"])
         Z1 = int(k["first_atom_type"])
         Z2 = int(k["second_atom_type"])
-        s2_pi = None
-        if is_symmetrized:
-            s2_pi = int(k["s2_pi"])
+        # Unused placeholder (0) when the tensor isn't symmetrized: dropped again
+        # below, when building the final (correctly-shaped) keys Labels.
+        s2_pi = int(k["s2_pi"]) if is_symmetrized else 0
 
-        for ip, (l1, l2, n1, n2) in enumerate(b.properties.values.tolist()):
+        # Cast explicitly: `.tolist()`'s runtime dtype must match this type hint
+        # exactly under TorchScript, and (only in the coupled, `rank == 1` path)
+        # `b.properties.values` can come through as 32-bit rather than 64-bit ints.
+        properties_values: list[list[int]] = b.properties.values.to(
+            torch.int64
+        ).tolist()
+        for ip, (l1, l2, n1, n2) in enumerate(properties_values):
             o3_sigma = (-1) ** (l1 + l2 + o3_lambda)
 
-            key: tuple[Any, ...] = (l1, l2)
-            if is_symmetrized:
-                key += tuple([s2_pi])
-            key += (Z1, Z2, n1, n2)
-            if key not in samples:
-                samples[key] = b_samples
+            key_values = [l1, l2, s2_pi, Z1, Z2, n1, n2]
+            key = "_".join([str(v) for v in key_values])
+            if key not in sample_labels:
+                key_order.append(key)
+                sample_labels[key] = b_samples
+                key_ints[key] = key_values
                 values[key] = torch.zeros(
                     (b_values.shape[0], 2 * l1 + 1, 2 * l2 + 1, 1),
                     dtype=b_values.dtype,
@@ -202,24 +199,26 @@ def _uncouple_tensor_blocks(
                 C,
                 b_values[..., ip],
             )
-            values[key].add_(v.reshape(*v.shape, 1))
+            values[key].add_(v.reshape(v.shape[0], v.shape[1], v.shape[2], 1))
 
     uncoupled_blocks: list[TensorBlock] = []
-    for (key, b_samples), v in zip(samples.items(), values.values(), strict=False):
-        l1, l2 = key[:2]
+    all_key_values: list[list[int]] = []
+    for key in key_order:
+        v = values[key]
+        l1, l2 = key_ints[key][0], key_ints[key][1]
         uncoupled_blocks.append(
             TensorBlock(
-                samples=b_samples,
+                samples=sample_labels[key],
                 components=[
                     Labels(
                         ["o3_mu_1"],
-                        torch.arange(-l1, l1 + 1, dtype=int, device=v.device).unsqueeze(
+                        torch.arange(-l1, l1 + 1, dtype=torch.int64, device=v.device).unsqueeze(
                             -1
                         ),
                     ),
                     Labels(
                         ["o3_mu_2"],
-                        torch.arange(-l2, l2 + 1, dtype=int, device=v.device).unsqueeze(
+                        torch.arange(-l2, l2 + 1, dtype=torch.int64, device=v.device).unsqueeze(
                             -1
                         ),
                     ),
@@ -228,13 +227,20 @@ def _uncouple_tensor_blocks(
                 values=v,
             )
         )
+        # (l1, l2, s2_pi, Z1, Z2, n1, n2) -> drop the s2_pi placeholder unless the
+        # tensor is actually symmetrized, matching `key_names` above.
+        if is_symmetrized:
+            all_key_values.append(key_ints[key])
+        else:
+            kv = key_ints[key]
+            all_key_values.append([kv[0], kv[1], kv[3], kv[4], kv[5], kv[6]])
 
     tensor_uncoupled = mts.remove_dimension(
         TensorMap(
             Labels(
                 key_names,
                 torch.tensor(
-                    list(samples.keys()), device=uncoupled_blocks[0].values.device
+                    all_key_values, device=uncoupled_blocks[0].values.device
                 ),
             ),
             uncoupled_blocks,
@@ -246,11 +252,14 @@ def _uncouple_tensor_blocks(
     return tensor_uncoupled
 
 
-def uncouple_tensor_blocks(*args, **kwargs) -> TensorMap:
-    """Elearn's uncouple_tensor_blocks function does not
-    add the o3_sigma names in the keys. This little
-    wrapper adds them."""
-    coupled = _uncouple_tensor_blocks(*args, **kwargs)
+def uncouple_tensor_blocks(
+    tensor: TensorMap,
+    cg_coeffs: TensorMap,
+) -> TensorMap:
+    """``_uncouple_tensor_blocks`` does not add the o3_sigma names in the keys;
+    this wraps it to add them. Signature narrowed from ``*args, **kwargs``:
+    TorchScript cannot compile variadic arguments."""
+    coupled = _uncouple_tensor_blocks(tensor, cg_coeffs)
 
     keys_names = (
         coupled.keys.names[:2] + ["o3_sigma_1", "o3_sigma_2"] + coupled.keys.names[2:]
@@ -364,7 +373,7 @@ def radial_to_spherical_harmonics(
     all_shs: dict[str, Tensor],
     layout: TensorMap,
     batched_neighborlist: TensorMap,
-    dense_cg_coeffs: Optional[TensorMap] = None,
+    dense_cg_coeffs: TensorMap,
 ) -> TensorMap:
 
     rank = len(layout.block(0).components)
