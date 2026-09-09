@@ -25,6 +25,7 @@ from metatrain.utils.data import DatasetInfo, TargetInfo
 from metatrain.utils.data.atom_pair_helpers import (
     check_no_atom_pair_targets,
     get_pair_sample_labels,
+    get_bidirectional_edges
 )
 from metatrain.utils.data.atomic_basis_helpers import (
     densify_atomic_basis_dataset_info,
@@ -633,6 +634,17 @@ class PET(ModelInterface[ModelHypers]):
                         outputs_for_additive_model,
                         selected_atoms,
                     )
+                    # For atom-pair (edge) contributions, restore anything
+                    # dropped by EdgeCompositionModel's own upper-triangular
+                    # masking (same-atom-type-pair samples, and entire missing
+                    # cross-type-ordered blocks alike) - a no-op for any
+                    # contribution this doesn't apply to (per-atom targets,
+                    # coupled-basis output).
+                    for name in additive_contributions:
+                        if self.dataset_info.targets[name].sample_kind == "atom_pair":
+                            additive_contributions[name] = get_bidirectional_edges(
+                                additive_contributions[name]
+                            )
                     for name in additive_contributions:
                         # TODO: uncomment this after metatensor.torch.add
                         # is updated to handle sparse sums
