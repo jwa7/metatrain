@@ -155,6 +155,12 @@ class PETBackend(torch.nn.Module):
         self.node_last_layers = torch.nn.ModuleDict()
         self.edge_last_layers = torch.nn.ModuleDict()
         self.is_atom_pair: Dict[str, bool] = {}
+        # For each atom-pair (edge) target, whether its edge readouts (inner and
+        # outer) gate on ``"center"`` (the central atom's type alone, matching node
+        # readouts) or ``"both"`` (the ordered pair of central- and neighbor-atom
+        # types) - see ``add_output``. Unset (never read) for non-atom-pair targets,
+        # which always gate on the central atom alone.
+        self.conditioned_on: Dict[str, str] = {}
         # Heads per readout layer for each target: 1 for ``head_type="per_target"``
         # (one head shared by all blocks), or the number of blocks for
         # ``head_type="per_block"``. The heads are stored in a flat, layer-major
@@ -215,6 +221,53 @@ class PETBackend(torch.nn.Module):
             {"atom_type_gating": False, "hypers": {}},
             spec_keys=("atom_type_gating",),
         )
+        gating = readout_spec.get("atom_type_gating", False)
+
+        # ``conditioned_on`` picks what an edge readout's group index encodes:
+        # ``"center"`` (the central atom's type alone - the only sensible choice
+        # for a per-atom/node target, and the long-standing PET behaviour) or
+        # ``"both"`` (the ordered pair of central- and neighbor-atom types, so a
+        # (Zn, O) edge and an (O, Zn) edge - and an (O, O) edge - each get their
+        # own weights, not just the one shared by every edge out of a given
+        # center). Defaults to ``"both"`` for atom-pair targets (this is what
+        # ``atom_type_gating`` conceptually promises for a per-*pair* target) and
+        # is fixed at ``"center"`` for per-atom targets, where there is no second
+        # atom to condition on.
+        conditioned_on = readout_spec.get(
+            "conditioned_on", "both" if is_atom_pair else "center"
+        )
+        if conditioned_on not in ("both", "center"):
+            raise ValueError(
+                f"Unknown conditioned_on: {conditioned_on!r} for target "
+                f"{target_name!r}. Available options are: 'both' and 'center'."
+            )
+        if not is_atom_pair and conditioned_on != "center":
+            raise ValueError(
+                f"conditioned_on={conditioned_on!r} is not available for target "
+                f"{target_name!r}: 'both' conditioning only makes sense for "
+                "atom-pair (edge) targets, which have a second atom to condition "
+                "on; per-atom targets only support conditioned_on='center'."
+            )
+        if conditioned_on == "both" and gating == "moe":
+            raise NotImplementedError(
+                "conditioned_on='both' is not currently supported together with "
+                "atom_type_gating='moe' for target "
+                f"{target_name!r} (only the 'one-hot' group readout has been "
+                "extended to per-neighbor-type conditioning so far). Use "
+                "atom_type_gating='one-hot', or conditioned_on='center', instead."
+            )
+        self.conditioned_on[target_name] = conditioned_on
+        # Edge readouts gate on the plain central-atom type ("center",
+        # ``num_atomic_species`` groups) or on the ordered pair of central- and
+        # neighbor-atom types ("both", ``num_atomic_species ** 2`` groups, laid
+        # out row-major as ``center * num_atomic_species + neighbor`` - see
+        # ``_calculate_atomic_predictions``). Node readouts always gate on the
+        # central atom alone, regardless of ``conditioned_on``.
+        edge_n_groups = (
+            self.num_atomic_species
+            if conditioned_on == "center"
+            else self.num_atomic_species**2
+        )
 
         # With ``head_type="per_target"`` a single head is shared by all of the
         # target's blocks; with ``"per_block"`` there is one head per block. Either
@@ -237,7 +290,10 @@ class PETBackend(torch.nn.Module):
                 torch.nn.ModuleDict(
                     {
                         key: self._make_readout(
-                            self.d_head_node, prod(shape), readout_spec
+                            self.d_head_node,
+                            prod(shape),
+                            readout_spec,
+                            self.num_atomic_species,
                         )
                         for key, shape in output_shapes.items()
                     }
@@ -251,7 +307,7 @@ class PETBackend(torch.nn.Module):
                 torch.nn.ModuleDict(
                     {
                         key: self._make_readout(
-                            self.d_head_edge, prod(shape), readout_spec
+                            self.d_head_edge, prod(shape), readout_spec, edge_n_groups
                         )
                         for key, shape in output_shapes.items()
                     }
@@ -279,6 +335,7 @@ class PETBackend(torch.nn.Module):
         if target_name in self.edge_last_layers:
             del self.edge_last_layers[target_name]
         self.is_atom_pair.pop(target_name, None)
+        self.conditioned_on.pop(target_name, None)
         self.heads_per_layer.pop(target_name, None)
 
     def _make_heads(
@@ -312,22 +369,35 @@ class PETBackend(torch.nn.Module):
         return torch.nn.ModuleList(heads)
 
     def _make_readout(
-        self, in_features: int, out_features: int, readout_spec: Dict[str, Any]
+        self,
+        in_features: int,
+        out_features: int,
+        readout_spec: Dict[str, Any],
+        n_groups: int,
     ) -> torch.nn.Module:
         """
         Build the (linear) readout for one output block.
 
         The readout is strictly linear; all nonlinearity lives in the heads. Its
-        optional conditioning on the central-atom type is set by
+        optional conditioning on the group index is set by
         ``readout_spec["atom_type_gating"]``: ``False`` for a single shared linear
         map (the standard PET readout), ``"one-hot"`` for an independent map per
-        atomic type, or ``"moe"`` for a mixture of experts routed by an embedding
-        of the atomic type.
+        group, or ``"moe"`` for a mixture of experts routed by an embedding of the
+        group.
+
+        What the group index means (and hence what ``n_groups`` should be) is
+        decided by the caller, not here: node readouts and ``conditioned_on
+        ="center"`` edge readouts group on the atomic type alone
+        (``n_groups = num_atomic_species``), while ``conditioned_on="both"`` edge
+        readouts group on the ordered pair of central- and neighbor-atom types
+        (``n_groups = num_atomic_species ** 2``) - see ``add_output``.
 
         :param in_features: Input feature dimension (the head dimension).
         :param out_features: Output feature dimension for this block.
         :param readout_spec: The per-target readout spec, with keys
             ``atom_type_gating`` and ``hypers``.
+        :param n_groups: Number of distinct values the group index passed to the
+            returned module's ``forward`` can take. Unused when gating is off.
         :return: A module with forward signature ``(features, group_idx)``.
         """
         gating = readout_spec.get("atom_type_gating", False)
@@ -339,14 +409,14 @@ class PETBackend(torch.nn.Module):
             return LinearReadout(
                 in_features,
                 out_features,
-                n_groups=self.num_atomic_species,
+                n_groups=n_groups,
                 bias=True,
             )
         if gating == "moe":
             return MoEReadout(
                 in_features,
                 out_features,
-                n_groups=self.num_atomic_species,
+                n_groups=n_groups,
                 num_experts=hypers["num_experts"],
                 num_routed_experts=hypers["num_routed_experts"],
                 num_topk_experts=hypers["num_topk_experts"],
@@ -575,6 +645,7 @@ class PETBackend(torch.nn.Module):
         centers = batch_data["centers"]
         nef_to_edges_neighbor = batch_data["nef_to_edges_neighbor"]
         element_indices_nodes = batch_data["element_indices_nodes"]
+        element_indices_neighbors = batch_data["element_indices_neighbors"]
 
         node_ll_features, edge_ll_features = self._calculate_last_layer_features(
             node_features_list,
@@ -591,6 +662,7 @@ class PETBackend(torch.nn.Module):
                 centers,
                 nef_to_edges_neighbor,
                 element_indices_nodes,
+                element_indices_neighbors,
             )
         )
 
@@ -846,6 +918,7 @@ class PETBackend(torch.nn.Module):
         centers: torch.Tensor,
         nef_to_edges_neighbor: torch.Tensor,
         element_indices_nodes: torch.Tensor,
+        element_indices_neighbors: torch.Tensor,
     ) -> Tuple[
         Dict[str, List[List[torch.Tensor]]], Dict[str, List[List[torch.Tensor]]]
     ]:
@@ -867,10 +940,13 @@ class PETBackend(torch.nn.Module):
         -- which is the block's own head under ``head_type="per_block"``, and the
         single head shared by all blocks under ``head_type="per_target"``.
 
-        The readouts also take a per-atom group index, used only when atom-type
-        conditioning is active and ignored otherwise. Both the node and the edge
-        readouts are conditioned on the central-atom type; for the edge readout the
-        type is therefore shared across that atom's neighbors.
+        The readouts also take a group index, used only when atom-type conditioning
+        is active and ignored otherwise. Node readouts (and edge readouts with
+        ``conditioned_on="center"``) are conditioned on the central-atom type alone,
+        so the group index is shared across that atom's neighbors; atom-pair (edge)
+        targets with ``conditioned_on="both"`` (the default for them - see
+        ``add_output``) instead use a per-neighbor group index encoding the ordered
+        (center, neighbor) type pair.
 
         :param node_last_layer_features_dict: Dictionary mapping output names to
             lists of node last layer features.
@@ -887,6 +963,11 @@ class PETBackend(torch.nn.Module):
             ``nef_tensor[centers, nef_to_edges_neighbor]`` recovers the flat edge
             array from a NEF-format tensor.
         :param element_indices_nodes: Species index of each central atom [n_atoms].
+        :param element_indices_neighbors: Species index of each neighbor, in NEF
+            layout [n_atoms, max_num_neighbors]. Only used for atom-pair targets
+            with ``conditioned_on="both"``, to condition the edge readout on the
+            ordered pair of central- and neighbor-atom types rather than on the
+            central atom alone - see ``add_output``.
         :return: Tuple of two dictionaries:
             - Dictionary mapping output names to lists of lists of node atomic
               prediction tensors (one list per GNN layer, one tensor per block)
@@ -938,6 +1019,17 @@ class PETBackend(torch.nn.Module):
                 is_atom_pair = self.is_atom_pair[output_name]
                 heads_per_layer = self.heads_per_layer[output_name]
                 edge_features = edge_last_layer_features_dict[output_name]
+                # "both" conditioning (atom-pair targets only, see ``add_output``)
+                # groups each NEF cell on the ordered (center, neighbor) type pair
+                # instead of the central atom alone, so a (Zn, O) and an (O, Zn)
+                # edge get independent readout weights.
+                if is_atom_pair and self.conditioned_on[output_name] == "both":
+                    edge_group_idx = (
+                        element_indices_nodes[:, None] * self.num_atomic_species
+                        + element_indices_neighbors
+                    )
+                else:
+                    edge_group_idx = element_indices_nodes
                 for i, edge_last_layer in enumerate(edge_last_layers):
                     edge_atomic_predictions_by_block: List[torch.Tensor] = []
                     j = 0
@@ -947,7 +1039,7 @@ class PETBackend(torch.nn.Module):
                         ]
                         j += 1
                         edge_atomic_predictions = edge_last_layer_by_block(
-                            features, element_indices_nodes
+                            features, edge_group_idx
                         )
                         if is_atom_pair:
                             # Gather the raw per-edge (NEF-format) predictions

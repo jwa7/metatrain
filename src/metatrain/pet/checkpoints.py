@@ -406,6 +406,33 @@ def model_update_v16_v17(checkpoint: dict) -> None:
         hypers["edge_composition"] = None
 
 
+def model_update_v17_v18(checkpoint: dict) -> None:
+    """
+    Update a v17 checkpoint to v18.
+
+    Backfills ``conditioned_on: "center"`` into every ``readout_type`` spec, the
+    value reproducing the previous behaviour. Before this version, edge (atom-pair)
+    readouts with atom-type gating enabled always conditioned on the central atom
+    alone; on this version that is no longer the default for atom-pair targets (it
+    is now ``"both"``, conditioning on the ordered pair of central- and
+    neighbor-atom types), so without this backfill an old atom-pair checkpoint with
+    gating enabled would be reconstructed with a different number of readout groups
+    and fail to load its ``state_dict``. Per-atom targets are unaffected either way,
+    since ``"center"`` is their only valid value.
+
+    :param checkpoint: The checkpoint to update.
+    """
+    readout_type = checkpoint["model_data"]["model_hypers"]["readout_type"]
+    if "atom_type_gating" in readout_type:
+        # Bare (global) spec.
+        readout_type.setdefault("conditioned_on", "center")
+    else:
+        # Per-target dict of specs.
+        for spec in readout_type.values():
+            if isinstance(spec, dict):
+                spec.setdefault("conditioned_on", "center")
+
+
 ###########################
 # TRAINER #################
 ###########################

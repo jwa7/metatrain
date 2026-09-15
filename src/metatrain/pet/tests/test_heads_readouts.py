@@ -254,3 +254,169 @@ def test_torchscript(head_type, gating):
         _hypers(head_type=head_type, readout_type=readout_type), _dataset_info()
     )
     torch.jit.script(model)
+
+
+# ===================================================================
+# ``conditioned_on``: atom-pair (edge) targets only, since it is only there that
+# the group index can encode more than the central atom's type. The target below
+# has a single, non-atomic-basis block (plain ``irreps`` list, not one keyed by
+# atomic type - see ``get_generic_target_info``), so - unlike ``TARGET`` above -
+# its block does *not* already split predictions by atom type; any type
+# dependence has to come from the readout's gating.
+# ===================================================================
+
+EDGE_IRREPS = [{"o3_lambda": 0, "o3_sigma": 1, "num": 1}]
+EDGE_TARGET = "mtt::edges"
+
+
+def _edge_dataset_info():
+    return DatasetInfo(
+        length_unit="Angstrom",
+        atomic_types=[1, 8],
+        targets={
+            EDGE_TARGET: get_generic_target_info(
+                EDGE_TARGET,
+                {
+                    "quantity": "",
+                    "unit": "",
+                    "type": {"spherical": {"irreps": EDGE_IRREPS}},
+                    "num_subtargets": 1,
+                    "sample_kind": "atom_pair",
+                },
+            )
+        },
+    )
+
+
+def _edge_block_keys(model):
+    return list(model.backend.edge_last_layers[EDGE_TARGET][0].keys())
+
+
+def _evaluate_edges(model):
+    model.eval()
+    return model(_systems(model), {EDGE_TARGET: ModelOutput(sample_kind="atom_pair")})[
+        EDGE_TARGET
+    ]
+
+
+def test_edge_conditioned_on_defaults_to_both_and_node_to_center():
+    """Edge targets default to pair-type conditioning; node targets never do."""
+    edge_model = PET(
+        _hypers(readout_type={"atom_type_gating": "one-hot"}), _edge_dataset_info()
+    )
+    assert edge_model.backend.conditioned_on[EDGE_TARGET] == "both"
+    edge_readout = edge_model.backend.edge_last_layers[EDGE_TARGET][0][
+        _edge_block_keys(edge_model)[0]
+    ]
+    # atomic_types=[1, 8]: 2 types, so 2 * 2 = 4 (center, neighbor) groups.
+    assert edge_readout.weight.shape[0] == 4
+
+    node_model = PET(
+        _hypers(readout_type={"atom_type_gating": "one-hot"}), _dataset_info()
+    )
+    assert node_model.backend.conditioned_on[TARGET] == "center"
+
+
+def test_edge_conditioned_on_center_matches_node_style_conditioning():
+    """``conditioned_on='center'`` groups edges the same way node readouts do."""
+    model = PET(
+        _hypers(
+            readout_type={"atom_type_gating": "one-hot", "conditioned_on": "center"}
+        ),
+        _edge_dataset_info(),
+    )
+    assert model.backend.conditioned_on[EDGE_TARGET] == "center"
+    readout = model.backend.edge_last_layers[EDGE_TARGET][0][_edge_block_keys(model)[0]]
+    assert readout.weight.shape[0] == 2
+    prediction = _evaluate_edges(model)
+    for block in prediction.blocks():
+        assert not block.values.isnan().any()
+
+
+def test_edge_both_conditioning_depends_on_neighbor_type_too():
+    """A pair's prediction must depend on *both* the center's and the neighbor's
+    type, not just the center's - perturbing the weights of one (center, neighbor)
+    group must leave every other group's edges untouched."""
+    model = PET(
+        _hypers(readout_type={"atom_type_gating": "one-hot"}), _edge_dataset_info()
+    )
+    model.eval()
+    # atomic_types=[1, 8] -> group index = center_type_idx * 2 + neighbor_type_idx.
+    # System is [O, H, H] (types [8, 1, 1], type index 1 for O and 0 for H), giving
+    # real edges in groups: H->H (0), H->O (1), O->H (2). O->O (3) is absent (only
+    # one O atom) and is perturbed as a control that must change nothing.
+    readout = model.backend.edge_last_layers[EDGE_TARGET][0][_edge_block_keys(model)[0]]
+    assert readout.weight.shape[0] == 4
+
+    before = _evaluate_edges(model).block().values.clone()
+    with torch.no_grad():
+        readout.weight[2] += 1.0  # the O->H group only
+    after = _evaluate_edges(model).block().values
+
+    reduce_dims = tuple(range(1, before.ndim))
+    changed_per_sample = ~torch.isclose(before, after).all(dim=reduce_dims)
+    assert changed_per_sample.any(), "perturbing a pair-type group changed nothing"
+    assert not changed_per_sample.all(), (
+        "every edge changed; conditioning is not per (center, neighbor) pair"
+    )
+
+    with torch.no_grad():
+        readout.weight[2] -= 1.0  # reset
+        readout.weight[3] += 1.0  # the (absent, in this system) O->O group
+    after_absent_group = _evaluate_edges(model).block().values
+    torch.testing.assert_close(before, after_absent_group)
+
+
+def test_conditioned_on_both_invalid_for_node_targets():
+    with pytest.raises(ValueError, match="conditioned_on"):
+        PET(
+            _hypers(
+                readout_type={"atom_type_gating": "one-hot", "conditioned_on": "both"}
+            ),
+            _dataset_info(),
+        )
+
+
+def test_unknown_conditioned_on_raises():
+    with pytest.raises(ValueError, match="Unknown conditioned_on"):
+        PET(
+            _hypers(
+                readout_type={
+                    "atom_type_gating": "one-hot",
+                    "conditioned_on": "nonsense",
+                }
+            ),
+            _edge_dataset_info(),
+        )
+
+
+def test_conditioned_on_both_with_moe_not_supported():
+    with pytest.raises(NotImplementedError, match="conditioned_on='both'"):
+        PET(
+            _hypers(
+                readout_type={
+                    "atom_type_gating": "moe",
+                    "hypers": {
+                        "num_experts": 3,
+                        "num_routed_experts": 2,
+                        "num_topk_experts": 1,
+                    },
+                }
+            ),
+            _edge_dataset_info(),
+        )
+
+
+@pytest.mark.parametrize("conditioned_on", ["both", "center"])
+def test_edge_torchscript(conditioned_on):
+    """Atom-pair targets with either conditioning must still export."""
+    model = PET(
+        _hypers(
+            readout_type={
+                "atom_type_gating": "one-hot",
+                "conditioned_on": conditioned_on,
+            }
+        ),
+        _edge_dataset_info(),
+    )
+    torch.jit.script(model)

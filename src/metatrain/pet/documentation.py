@@ -280,24 +280,25 @@ class ModelHypers(TypedDict):
 
     The readout is a strictly *linear* map from the head dimension to each block's
     output dimension; all nonlinearity lives in the heads (see :attr:`head_type`).
-    This hyper controls optional atom-type conditioning of that linear map. For
-    atom-pair (edge) targets, both the node and the edge readouts are conditioned
-    on the *central* atom's type (shared across that atom's neighbors) - see
-    :attr:`~metatrain.pet.documentation.ModelHypers.d_head`.
+    This hyper controls optional atom-type conditioning of that linear map, and, for
+    atom-pair (edge) targets, what the conditioning is *on* (see ``conditioned_on``
+    below).
 
     ``{atom_type_gating: false}`` (default): a single shared linear readout per
     block, with no atom-type conditioning. This is the standard PET readout.
 
-    ``{atom_type_gating: "one-hot"}``: an independent linear readout per atomic
-    type, selected by the central-atom type. This is the natural readout for
-    targets whose blocks span several atomic types, such as atom-centered basis
-    expansions of a scalar field, where each type needs its own map onto a
-    property axis padded to the largest per-type basis.
+    ``{atom_type_gating: "one-hot"}``: an independent linear readout per group
+    (see ``conditioned_on``). This is the natural readout for targets whose blocks
+    span several atomic types, such as atom-centered basis expansions of a scalar
+    field, where each type needs its own map onto a property axis padded to the
+    largest per-type basis.
 
     ``{atom_type_gating: "moe", hypers: {...}}``: a mixture-of-experts linear
     readout whose experts are gated by routing weights from a learned embedding of
-    the central-atom type. Note that every expert is evaluated for every atom, so
-    this costs ``num_experts`` times a plain readout.
+    the group (see ``conditioned_on``). Note that every expert is evaluated for
+    every atom, so this costs ``num_experts`` times a plain readout. Only
+    ``conditioned_on: "center"`` is currently supported together with
+    ``atom_type_gating: "moe"``.
 
     .. code-block:: yaml
 
@@ -308,6 +309,21 @@ class ModelHypers(TypedDict):
             num_routed_experts: 5
             num_topk_experts: 2
             embedding_dim: 16   # optional, default 16
+
+    ``conditioned_on`` picks what the group index is, and is only meaningful when
+    ``atom_type_gating`` is set. ``"center"``: the central atom's type alone,
+    shared across that atom's neighbors for edge readouts - the only option
+    available for per-atom (node) targets, since they have no second atom to
+    condition on. ``"both"`` (default for atom-pair/edge targets, unavailable for
+    per-atom targets): the *ordered pair* of central- and neighbor-atom types, so
+    e.g. a (Zn, O) edge and an (O, Zn) edge get independent readout weights rather
+    than sharing the one keyed on their common central atom.
+
+    .. code-block:: yaml
+
+        readout_type:
+          atom_type_gating: one-hot
+          conditioned_on: center   # instead of the atom-pair default of "both"
 
     May also be set *per target* by passing a dict keyed by target name whose
     values are per-target specs. A spec containing the ``atom_type_gating`` key

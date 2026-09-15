@@ -146,8 +146,12 @@ class LinearReadout(torch.nn.Module):
         :param features: ``(n_rows, in_features)`` (e.g. node features) or
             ``(n_rows, n_columns, in_features)`` (e.g. edge features in NEF
             layout, or equivariant features with a component dimension).
-        :param group_idx: Long tensor of shape ``(n_rows,)`` selecting the gating
-            group for each row of ``features``. Ignored when ungated.
+        :param group_idx: Long tensor selecting the gating group, either
+            ``(n_rows,)`` (one group per row, broadcast across any column
+            dimension - e.g. an edge's central-atom type) or, only when
+            ``features`` is 3-D, ``(n_rows, n_columns)`` (one group per cell -
+            e.g. an edge's *pair* of atom types, one column per neighbor).
+            Ignored when ungated.
         :return: Same leading dimensions as ``features``, with last dimension
             ``out_features``.
         """
@@ -168,7 +172,8 @@ class LinearReadout(torch.nn.Module):
 
         :param features: ``(n_rows, in_features)`` or
             ``(n_rows, n_columns, in_features)``.
-        :param group_idx: Long tensor of shape ``(n_rows,)``.
+        :param group_idx: Long tensor, either ``(n_rows,)`` or (3-D ``features``
+            only) ``(n_rows, n_columns)`` - see :meth:`forward`.
         :return: ``features`` with its last dimension replaced by ``out_features``.
         """
         # Promote 2-D features to 3-D so the node and edge cases are handled
@@ -191,12 +196,18 @@ class LinearReadout(torch.nn.Module):
             flat_bias,
         )  # (n_rows, n_columns, n_groups * out_features)
 
-        # Keep only the group each row belongs to. ``index`` is an expanded view
-        # (stride 0 along the broadcast dimensions), so it costs no real memory.
+        # Keep only the group each row (or, with a per-cell group_idx, each cell)
+        # belongs to. ``index`` is an expanded view (stride 0 along the broadcast
+        # dimensions), so it costs no real memory.
         out = out.reshape(n_rows, n_columns, self.n_groups, self.out_features)
-        index = group_idx.reshape(n_rows, 1, 1, 1).expand(
-            n_rows, n_columns, 1, self.out_features
-        )
+        if group_idx.dim() == 1:
+            index = group_idx.reshape(n_rows, 1, 1, 1).expand(
+                n_rows, n_columns, 1, self.out_features
+            )
+        else:
+            index = group_idx.reshape(n_rows, n_columns, 1, 1).expand(
+                n_rows, n_columns, 1, self.out_features
+            )
         out = out.gather(2, index).squeeze(2)
 
         if is_2d:
