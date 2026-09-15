@@ -64,6 +64,50 @@ def get_requested_neighbor_lists(
     return requested
 
 
+def get_own_requested_neighbor_lists(
+    requested_neighbor_lists: List[NeighborListOptions],
+) -> List[NeighborListOptions]:
+    """Filter a list of requested neighbor lists (as returned by
+    :func:`get_requested_neighbor_lists`) down to the ones requested by the
+    architecture itself, excluding any requested only by an additive baseline
+    (composition, ZBL, an ``EdgeCompositionModel``, ...) or the scaler.
+
+    This matters wherever a neighbor list is used to decide how far out a
+    *model's own* predictions reach (e.g. padding an atom-pair target's sample
+    grid to match what the model can actually predict for): an additive baseline
+    can request a neighbor list of its own, wider or narrower than the
+    architecture's, which is unrelated to what the architecture itself predicts
+    and must not be picked up there.
+
+    Every metatrain architecture stores its additive baselines and scaler on
+    ``self.additive_models`` / ``self.scaler`` (see e.g. ``PET.__init__``), so
+    :func:`_get_requested_neighbor_lists_in_place`'s dotted per-requestor module
+    path - built by prefixing child module names, starting from the model
+    itself - names any neighbor list requested *only* by one of them with an
+    ``"additive_models"`` or ``"scaler"`` path component; a neighbor list
+    requested (also, or only) by the architecture itself is never tagged with
+    either, regardless of how many wrapper layers it has been traversed through
+    (e.g. after being loaded back from an exported model, where the raw
+    architecture is nested a level or two below the top-level wrapper this
+    function's caller actually sees) - unlike an empty ``requestors()`` list,
+    which only identifies the true top-level module and so is not usable as this
+    filter once any such wrapping is involved.
+
+    :param requested_neighbor_lists: Neighbor lists to filter, as returned by
+        :func:`get_requested_neighbor_lists`.
+    :return: The subset of ``requested_neighbor_lists`` requested by the
+        architecture itself.
+    """
+    return [
+        nl
+        for nl in requested_neighbor_lists
+        if not any(
+            "additive_models" in requestor or "scaler" in requestor
+            for requestor in nl.requestors()
+        )
+    ]
+
+
 def _get_requested_neighbor_lists_in_place(
     module: torch.nn.Module,
     module_name: str,

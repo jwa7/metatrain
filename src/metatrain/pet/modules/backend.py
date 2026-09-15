@@ -7,8 +7,9 @@ from ...utils.hypers import resolve_per_target
 from ...utils.readout import LinearReadout, MoEReadout
 from ..documentation import ModelHypers
 from .conditioning import SystemConditioningEmbedding
-from .structures import compute_batch_tensors
+from .structures import compute_batch_tensors, compute_flat_edge_vectors
 from .transformer import CartesianTransformer
+from .utilities import apply_cutoff_function
 
 
 class PETBackend(torch.nn.Module):
@@ -41,6 +42,22 @@ class PETBackend(torch.nn.Module):
         self.cutoff = float(hypers["cutoff"])
         self.cutoff_function = hypers["cutoff_function"]
         self.cutoff_width = float(hypers["cutoff_width"])
+        # Outer cutoff for the cheap node-product route on atom-pair (edge) targets
+        # (see ``add_output``/``compute_outer_atomic_predictions``). Kept as a plain
+        # float (defaulting to ``cutoff`` itself when disabled, rather than
+        # ``Optional[float]``) so TorchScript doesn't need to reason about a
+        # possibly-``None`` attribute; ``has_outer_cutoff`` is the actual switch.
+        cutoff_matrix_edges = hypers["cutoff_matrix_edges"]
+        self.has_outer_cutoff = cutoff_matrix_edges is not None
+        if self.has_outer_cutoff:
+            if cutoff_matrix_edges <= self.cutoff:
+                raise ValueError(
+                    f"cutoff_matrix_edges ({cutoff_matrix_edges}) must be greater "
+                    f"than cutoff ({self.cutoff})."
+                )
+            self.cutoff_matrix_edges = float(cutoff_matrix_edges)
+        else:
+            self.cutoff_matrix_edges = self.cutoff
         self.num_neighbors_adaptive = (
             float(hypers["num_neighbors_adaptive"])
             if hypers["num_neighbors_adaptive"] is not None
@@ -166,6 +183,14 @@ class PETBackend(torch.nn.Module):
         # ``head_type="per_block"``. The heads are stored in a flat, layer-major
         # ``ModuleList``, and this is the stride needed to index into it.
         self.heads_per_layer: Dict[str, int] = {}
+        # Outer cutoff ("node-product") heads/last-layers for atom-pair targets,
+        # populated in ``add_output`` only when ``has_outer_cutoff``. Unlike the
+        # inner heads above, there is exactly one of these per target (not one per
+        # GNN readout layer): the outer route is a single, cheap MLP applied once
+        # to the two atoms' final node features, not summed over GNN layers - see
+        # ``compute_outer_atomic_predictions``.
+        self.outer_edge_heads = torch.nn.ModuleDict()
+        self.outer_last_layers = torch.nn.ModuleDict()
 
         # ===== BEGIN DIAGNOSTIC-RELATED ATTRIBUTES
         # These are used to capture the node and edge features from each GNN layer post
@@ -257,11 +282,12 @@ class PETBackend(torch.nn.Module):
                 "atom_type_gating='one-hot', or conditioned_on='center', instead."
             )
         self.conditioned_on[target_name] = conditioned_on
-        # Edge readouts gate on the plain central-atom type ("center",
-        # ``num_atomic_species`` groups) or on the ordered pair of central- and
-        # neighbor-atom types ("both", ``num_atomic_species ** 2`` groups, laid
-        # out row-major as ``center * num_atomic_species + neighbor`` - see
-        # ``_calculate_atomic_predictions``). Node readouts always gate on the
+        # Edge (inner and outer) readouts gate on the plain central-atom type
+        # ("center", ``num_atomic_species`` groups) or on the ordered pair of
+        # central- and neighbor-atom types ("both", ``num_atomic_species ** 2``
+        # groups, laid out row-major as ``center * num_atomic_species +
+        # neighbor`` - see ``_calculate_atomic_predictions`` and
+        # ``compute_outer_atomic_predictions``). Node readouts always gate on the
         # central atom alone, regardless of ``conditioned_on``.
         edge_n_groups = (
             self.num_atomic_species
@@ -316,6 +342,26 @@ class PETBackend(torch.nn.Module):
             ]
         )
 
+        # Outer cutoff ("node-product") route: only for atom-pair targets, and only
+        # when an outer cutoff was actually requested. A single head (not one per
+        # readout layer - see ``compute_outer_atomic_predictions``) maps the
+        # concatenated (node_i, node_j, edge_vector, edge_distance) - dimension
+        # ``2 * d_node + 4`` - to the same ``d_head_edge`` the inner edge heads
+        # produce, so it can share the exact same per-block readout convention
+        # (``_make_readout``, same ``readout_spec``) as the inner route.
+        if is_atom_pair and self.has_outer_cutoff:
+            self.outer_edge_heads[target_name] = self._make_one_head(
+                2 * self.d_node + 4, self.d_head_edge
+            )
+            self.outer_last_layers[target_name] = torch.nn.ModuleDict(
+                {
+                    key: self._make_readout(
+                        self.d_head_edge, prod(shape), readout_spec, edge_n_groups
+                    )
+                    for key, shape in output_shapes.items()
+                }
+            )
+
     def remove_output(self, target_name: str) -> None:
         """
         Remove the node/edge heads and last layers for a previously registered output
@@ -334,6 +380,10 @@ class PETBackend(torch.nn.Module):
             del self.node_last_layers[target_name]
         if target_name in self.edge_last_layers:
             del self.edge_last_layers[target_name]
+        if target_name in self.outer_edge_heads:
+            del self.outer_edge_heads[target_name]
+        if target_name in self.outer_last_layers:
+            del self.outer_last_layers[target_name]
         self.is_atom_pair.pop(target_name, None)
         self.conditioned_on.pop(target_name, None)
         self.heads_per_layer.pop(target_name, None)
@@ -359,14 +409,24 @@ class PETBackend(torch.nn.Module):
         """
         heads: List[torch.nn.Module] = []
         for _ in range(self.num_readout_layers * heads_per_layer):
-            layers: List[torch.nn.Module] = [
-                torch.nn.Linear(d_in, d_out),
-                torch.nn.SiLU(),
-            ]
-            for _ in range(self.num_head_layers - 1):
-                layers.extend([torch.nn.Linear(d_out, d_out), torch.nn.SiLU()])
-            heads.append(torch.nn.Sequential(*layers))
+            heads.append(self._make_one_head(d_in, d_out))
         return torch.nn.ModuleList(heads)
+
+    def _make_one_head(self, d_in: int, d_out: int) -> torch.nn.Module:
+        """
+        Build a single head MLP: ``num_head_layers`` Linear+SiLU layers, the first
+        mapping ``d_in`` -> ``d_out`` and the rest ``d_out`` -> ``d_out``. Factored
+        out of :meth:`_make_heads` so the outer-cutoff node-product route (which
+        needs exactly one such head per target, not one per readout layer - see
+        ``outer_edge_heads``) can reuse the same layer construction.
+        """
+        layers: List[torch.nn.Module] = [
+            torch.nn.Linear(d_in, d_out),
+            torch.nn.SiLU(),
+        ]
+        for _ in range(self.num_head_layers - 1):
+            layers.extend([torch.nn.Linear(d_out, d_out), torch.nn.SiLU()])
+        return torch.nn.Sequential(*layers)
 
     def _make_readout(
         self,
@@ -438,6 +498,9 @@ class PETBackend(torch.nn.Module):
         cell_shifts: torch.Tensor,
         system_indices: torch.Tensor,
         cutoff_width_adaptive: float,
+        centers_outer: torch.Tensor,
+        neighbors_outer: torch.Tensor,
+        cell_shifts_outer: torch.Tensor,
     ) -> Dict[str, torch.Tensor]:
         """
         Run structure preprocessing on plain tensors.
@@ -458,6 +521,13 @@ class PETBackend(torch.nn.Module):
         :param system_indices: System index for each atom, shape ``(num_nodes,)``.
         :param cutoff_width_adaptive: Width of the smooth cutoff taper used by the
             adaptive cutoff scheme when ``num_neighbors_adaptive`` is set.
+        :param centers_outer: Flat center atom global indices for the *outer*-cutoff
+            neighbor list (see ``has_outer_cutoff``), shape ``(n_outer_edges,)``.
+            Empty when ``has_outer_cutoff`` is ``False``.
+        :param neighbors_outer: Flat neighbor atom global indices for the outer-cutoff
+            neighbor list, shape ``(n_outer_edges,)``.
+        :param cell_shifts_outer: Integer cell shift vectors for the outer-cutoff
+            neighbor list, shape ``(n_outer_edges, 3)``.
         :return: A dictionary ``batch_data`` of the intermediate tensors:
             - `element_indices_nodes`: The atomic species of the central atoms
             - `element_indices_neighbors`: The atomic species of the neighboring atoms
@@ -486,6 +556,13 @@ class PETBackend(torch.nn.Module):
             - `cell_shifts`: Integer cell shift vectors for each real (non-padded) edge,
             shape ``(n_edges, 3)``. Columns correspond to ``(cell_shift_a, cell_shift_b,
             cell_shift_c)``. Suitable for use with :func:`get_pair_sample_labels`.
+
+            When ``has_outer_cutoff`` is ``True``, also:
+            - `edge_vectors_outer`/`edge_distances_outer`: As above, for the flat
+                (non-NEF) outer-cutoff edge list.
+            - `outer_weight`: Per-outer-edge smooth weight for the node-product route,
+                shape ``(n_outer_edges,)`` - see
+                :meth:`compute_outer_atomic_predictions`.
         """
         (
             element_indices_nodes,
@@ -532,6 +609,56 @@ class PETBackend(torch.nn.Module):
             "nef_to_edges_neighbor": nef_to_edges_neighbor,
             "cell_shifts": cell_shifts,
         }
+
+        if self.has_outer_cutoff:
+            edge_vectors_outer, edge_distances_outer = compute_flat_edge_vectors(
+                positions, centers_outer, neighbors_outer, cells, cell_shifts_outer,
+                system_indices,
+            )
+            if not self.nl_is_strict:
+                # Mirrors the equivalent filtering for the inner cutoff in
+                # ``compute_batch_tensors`` - a non-strict neighbor list may return
+                # pairs beyond the requested cutoff.
+                keep = torch.nonzero(edge_distances_outer <= self.cutoff_matrix_edges)
+                keep = keep.squeeze(-1)
+                centers_outer = centers_outer.index_select(0, keep)
+                neighbors_outer = neighbors_outer.index_select(0, keep)
+                cell_shifts_outer = cell_shifts_outer.index_select(0, keep)
+                edge_vectors_outer = edge_vectors_outer.index_select(0, keep)
+                edge_distances_outer = edge_distances_outer.index_select(0, keep)
+
+            # Smooth weight for the node-product route: 0 well inside the inner
+            # cutoff (where the attention route alone applies), rising smoothly as
+            # an edge exits the inner cutoff, and back to 0 at the outer cutoff -
+            # rather than the node-product route being truncated there. Reuses the
+            # same envelope (and hence the same ``cutoff_width``) as the inner
+            # cutoff, just evaluated at two different cutoff radii; the two
+            # envelopes are individually clamped to [0, 1], so their difference is
+            # always in [-1, 1] and only needs a lower clamp at 0 (it cannot
+            # exceed 1: the inner envelope is already >= 0 everywhere).
+            inner_envelope_outer_edges = apply_cutoff_function(
+                edge_distances_outer,
+                torch.full_like(edge_distances_outer, self.cutoff),
+                self.cutoff_width,
+                self.cutoff_function,
+            )
+            outer_envelope_outer_edges = apply_cutoff_function(
+                edge_distances_outer,
+                torch.full_like(edge_distances_outer, self.cutoff_matrix_edges),
+                self.cutoff_width,
+                self.cutoff_function,
+            )
+            outer_weight = (
+                outer_envelope_outer_edges - inner_envelope_outer_edges
+            ).clamp(min=0.0)
+
+            batch_data["centers_outer"] = centers_outer
+            batch_data["neighbors_outer"] = neighbors_outer
+            batch_data["cell_shifts_outer"] = cell_shifts_outer
+            batch_data["edge_vectors_outer"] = edge_vectors_outer
+            batch_data["edge_distances_outer"] = edge_distances_outer
+            batch_data["outer_weight"] = outer_weight
+
         return batch_data
 
     def calculate_features(
@@ -622,6 +749,7 @@ class PETBackend(torch.nn.Module):
         Dict[str, List[torch.Tensor]],
         Dict[str, List[torch.Tensor]],
         Dict[str, List[torch.Tensor]],
+        Dict[str, List[torch.Tensor]],
     ]:
         """
         Compute the per-block atomic predictions and last-layer features.
@@ -635,10 +763,18 @@ class PETBackend(torch.nn.Module):
             normalize non-conservative stress predictions by cell volume.
         :param system_indices: System index for each atom, shape ``(num_nodes,)``.
         :param requested_output_names: Names of the target outputs to compute.
-        :return: A tuple ``(atomic_predictions, node_ll_features, edge_ll_features)``
-            where ``atomic_predictions`` maps each requested output to a list of
-            per-block flat prediction tensors, and the last-layer feature dictionaries
-            map each output to its per-layer node / edge last-layer features.
+        :return: A tuple ``(atomic_predictions, node_ll_features, edge_ll_features,
+            outer_atomic_predictions)``. ``atomic_predictions`` maps each requested
+            output to a list of per-block flat (inner-cutoff) prediction tensors, and
+            the last-layer feature dictionaries map each output to its per-layer
+            node / edge last-layer features. ``outer_atomic_predictions`` maps each
+            atom-pair output with an outer cutoff to a list of per-block flat
+            prediction tensors, one row per *outer*-cutoff edge (a different, larger
+            sample set than ``atomic_predictions``' own edges) - see
+            :meth:`compute_outer_atomic_predictions`. Combining the two, sample by
+            sample, is left to the metatensor-aware caller (:class:`metatrain.pet.
+            model.PET`), since this pure-tensor module has no notion of a sample's
+            identity.
         """
         padding_mask = batch_data["padding_mask"]
         cutoff_factors = batch_data["cutoff_factors"]
@@ -664,6 +800,13 @@ class PETBackend(torch.nn.Module):
                 element_indices_nodes,
                 element_indices_neighbors,
             )
+        )
+
+        outer_atomic_predictions = self.compute_outer_atomic_predictions(
+            node_features_list[-1],
+            batch_data,
+            requested_output_names,
+            element_indices_nodes,
         )
 
         # Sum the node and edge contributions over all GNN layers, block by block. Node
@@ -705,7 +848,99 @@ class PETBackend(torch.nn.Module):
 
             atomic_predictions[output_name] = block_sums
 
-        return atomic_predictions, node_ll_features, edge_ll_features
+        return (
+            atomic_predictions,
+            node_ll_features,
+            edge_ll_features,
+            outer_atomic_predictions,
+        )
+
+    def compute_outer_atomic_predictions(
+        self,
+        node_features_final: torch.Tensor,
+        batch_data: Dict[str, torch.Tensor],
+        requested_output_names: List[str],
+        element_indices_nodes: torch.Tensor,
+    ) -> Dict[str, List[torch.Tensor]]:
+        """
+        Outer-cutoff ("node-product") contribution to atom-pair (edge) targets: a
+        single cheap MLP applied to the two atoms' own final node features together
+        with an embedding of their pair geometry - no attention, no message passing,
+        and (unlike the inner route) no summing over GNN readout layers, since this
+        route only ever uses the last one.
+
+        :param node_features_final: The *last* GNN layer's node features (dimension
+            ``d_node``), shape ``(num_nodes, d_node)``. Defined for every atom in the
+            batch regardless of any cutoff, since node features come from species
+            embeddings updated by message passing, not from the edges themselves.
+        :param batch_data: Dictionary containing ``centers_outer``/``neighbors_outer``/
+            ``edge_vectors_outer``/``edge_distances_outer``/``outer_weight``, as
+            computed by :meth:`preprocess` when ``has_outer_cutoff``.
+        :param requested_output_names: Names of the target outputs to compute.
+        :param element_indices_nodes: Species index of each atom in the batch, shape
+            ``(num_nodes,)`` - used to condition the (block) readout on the central
+            atom's type, or on the ordered (center, neighbor) type pair for targets
+            with ``conditioned_on="both"``, exactly as the inner route does.
+        :return: Dictionary mapping each atom-pair output that has an outer route to
+            a list of per-block flat prediction tensors, one row per outer-cutoff
+            edge, in the same block order as ``outer_last_layers[output_name]``.
+            Outputs without an outer route (non-atom-pair targets, or any output at
+            all when ``has_outer_cutoff`` is ``False``) are simply absent from the
+            returned dictionary.
+        """
+        outer_atomic_predictions: Dict[str, List[torch.Tensor]] = {}
+        if not self.has_outer_cutoff:
+            return outer_atomic_predictions
+
+        centers_outer = batch_data["centers_outer"]
+        neighbors_outer = batch_data["neighbors_outer"]
+        edge_vectors_outer = batch_data["edge_vectors_outer"]
+        edge_distances_outer = batch_data["edge_distances_outer"]
+        outer_weight = batch_data["outer_weight"]
+        element_indices_centers_outer = element_indices_nodes[centers_outer]
+
+        # Iterated together (rather than indexing ``outer_last_layers`` by the
+        # ``output_name`` obtained from ``outer_edge_heads``): TorchScript only
+        # supports indexing a ``ModuleDict`` with a string *literal*, not a runtime
+        # variable, even one that (as here) always names an existing entry - see
+        # ``add_output``, where both are always populated together, in the same
+        # target-name order, for exactly this reason.
+        for (output_name, outer_head), (_, block_readouts) in zip(
+            self.outer_edge_heads.items(), self.outer_last_layers.items(), strict=True
+        ):
+            if output_name in requested_output_names:
+                node_i = node_features_final[centers_outer]
+                node_j = node_features_final[neighbors_outer]
+                raw_input = torch.cat(
+                    [
+                        node_i,
+                        node_j,
+                        edge_vectors_outer,
+                        edge_distances_outer[:, None],
+                    ],
+                    dim=-1,
+                )
+                features = outer_head(raw_input)
+
+                # Outer-route edges are already flat (one row per edge, not NEF), so
+                # "both" conditioning stays 1-D here too - just combining both ends'
+                # types instead of the center's alone.
+                if self.conditioned_on[output_name] == "both":
+                    group_idx = (
+                        element_indices_nodes[centers_outer] * self.num_atomic_species
+                        + element_indices_nodes[neighbors_outer]
+                    )
+                else:
+                    group_idx = element_indices_centers_outer
+
+                predictions_by_block: List[torch.Tensor] = []
+                for readout in block_readouts.values():
+                    block_prediction = readout(features, group_idx)
+                    block_prediction = block_prediction * outer_weight[:, None]
+                    predictions_by_block.append(block_prediction)
+                outer_atomic_predictions[output_name] = predictions_by_block
+
+        return outer_atomic_predictions
 
     def _feedforward_featurization_impl(
         self, inputs: Dict[str, torch.Tensor], use_manual_attention: bool
@@ -1044,14 +1279,30 @@ class PETBackend(torch.nn.Module):
                         if is_atom_pair:
                             # Gather the raw per-edge (NEF-format) predictions
                             # directly into a flat per-edge tensor, one row per real
-                            # (non-padded) edge - no cutoff weighting or neighbor
-                            # pooling, since each edge is its own sample. (Written as
-                            # an if/else, rather than an early `continue`, since
-                            # TorchScript does not support `break`/`continue` inside
-                            # loops over a ``ModuleDict``/``ModuleList``, which are
-                            # unrolled at script time.)
+                            # (non-padded) edge - no neighbor pooling, since each
+                            # edge is its own sample. (Written as an if/else, rather
+                            # than an early `continue`, since TorchScript does not
+                            # support `break`/`continue` inside loops over a
+                            # ``ModuleDict``/``ModuleList``, which are unrolled at
+                            # script time.)
+                            #
+                            # Unlike a per-atom target, this contribution is *not*
+                            # pooled over neighbors, but it still needs the same
+                            # smooth cutoff weighting: without it, a pair's
+                            # prediction would jump discontinuously to 0 the instant
+                            # it exits the (inner) neighbor list as atoms move
+                            # apart - and, with an outer cutoff configured, that
+                            # discontinuity would show up as a kink against the
+                            # smoothly-rising node-product route taking over at the
+                            # same boundary (see ``compute_outer_atomic_predictions``
+                            # and its ``outer_weight``, which is built as the
+                            # complement of this same envelope).
+                            inner_weight = cutoff_factors[
+                                centers, nef_to_edges_neighbor
+                            ]
                             edge_atomic_predictions_by_block.append(
                                 edge_atomic_predictions[centers, nef_to_edges_neighbor]
+                                * inner_weight[:, None]
                             )
                         else:
                             expanded_padding_mask = padding_mask[..., None].repeat(

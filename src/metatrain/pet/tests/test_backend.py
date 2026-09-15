@@ -116,6 +116,12 @@ def _backend_inputs(model, system):
         cell_shifts,
         system_indices,
         model.cutoff_width_adaptive,
+        # No outer cutoff in these tests (``MODEL_HYPERS`` doesn't set
+        # ``cutoff_matrix_edges``): empty tensors, matching what ``PET.forward``
+        # itself passes when ``has_outer_cutoff`` is ``False``.
+        torch.empty(0, dtype=centers.dtype),
+        torch.empty(0, dtype=neighbors.dtype),
+        torch.empty((0, 3), dtype=cell_shifts.dtype),
     )
 
 
@@ -124,16 +130,8 @@ def test_backend_runs_on_plain_tensors():
     model = PET(MODEL_HYPERS, _make_dataset_info()).eval()
     backend = model.backend
     inputs = _backend_inputs(model, _make_system(model))
-    (
-        positions,
-        centers,
-        neighbors,
-        species,
-        cells,
-        cell_shifts,
-        system_indices,
-        cutoff_width_adaptive,
-    ) = inputs
+    cells = inputs[4]
+    system_indices = inputs[6]
 
     batch_data = backend.preprocess(*inputs)
     assert isinstance(batch_data, dict)
@@ -143,7 +141,7 @@ def test_backend_runs_on_plain_tensors():
     assert all(isinstance(t, torch.Tensor) for t in node_list)
     assert all(isinstance(t, torch.Tensor) for t in edge_list)
 
-    atomic_predictions, node_ll, edge_ll = backend.predict(
+    atomic_predictions, node_ll, edge_ll, _ = backend.predict(
         node_list, edge_list, batch_data, cells, system_indices, ["energy"]
     )
     assert "energy" in atomic_predictions
@@ -166,7 +164,7 @@ def test_backend_predictions_match_full_model():
     system_indices = inputs[6]
     batch_data = backend.preprocess(*inputs)
     node_list, edge_list = backend.calculate_features(batch_data)
-    atomic_predictions, _, _ = backend.predict(
+    atomic_predictions, _, _, _ = backend.predict(
         node_list, edge_list, batch_data, cells, system_indices, ["energy"]
     )
 
@@ -228,6 +226,9 @@ def test_backend_torch_compile(fullgraph):
         cell_shifts,
         system_indices,
         cutoff_width_adaptive,
+        centers_outer,
+        neighbors_outer,
+        cell_shifts_outer,
     ) = _backend_inputs(model, system)
 
     inputs = (
@@ -239,6 +240,9 @@ def test_backend_torch_compile(fullgraph):
         cell_shifts,
         system_indices,
         cutoff_width_adaptive,
+        centers_outer,
+        neighbors_outer,
+        cell_shifts_outer,
     )
     batch_data_e = backend.preprocess(*inputs)
 
@@ -269,9 +273,12 @@ def test_backend_torch_compile(fullgraph):
                 cell_shifts,
                 system_indices,
                 cutoff_width_adaptive,
+                centers_outer,
+                neighbors_outer,
+                cell_shifts_outer,
             )
             node_list, edge_list = backend.calculate_features(batch_data)
-            preds, _, _ = backend.predict(
+            preds, _, _, _ = backend.predict(
                 node_list,
                 edge_list,
                 batch_data,

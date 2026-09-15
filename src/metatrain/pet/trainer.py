@@ -39,6 +39,7 @@ from metatrain.utils.logging import ROOT_LOGGER, MetricLogger
 from metatrain.utils.loss import LossAggregator, LossSpecification
 from metatrain.utils.metrics import MAEAccumulator, RMSEAccumulator, get_selected_metric
 from metatrain.utils.neighbor_lists import (
+    get_own_requested_neighbor_lists,
     get_requested_neighbor_lists,
     get_system_with_neighbor_lists_transform,
 )
@@ -188,7 +189,25 @@ class Trainer(TrainerInterface[TrainerHypers]):
             target_info_dict=train_targets, extra_data_info_dict=extra_data_info
         )
         requested_neighbor_lists = get_requested_neighbor_lists(model)
-        nl_options = requested_neighbor_lists[0]
+        # Padding atom-pair (edge) targets must use the *largest* cutoff PET's own
+        # backbone can actually predict for - otherwise, with an outer cutoff
+        # (`cutoff_matrix_edges`) enabled, the model predicts edges the target's
+        # own padded sample grid was never built to include, and the loss
+        # computation's prediction/target tensors come out different sizes.
+        # Harmless for per-atom targets, which don't use `nl_options` at all.
+        #
+        # This must come from PET's *own* requested neighbor list(s)
+        # (`get_own_requested_neighbor_lists`, filtering out anything requested
+        # only by a submodule), not from `requested_neighbor_lists` as a whole:
+        # an additive baseline registered on `model` - e.g. an
+        # `EdgeCompositionModel` (`edge_composition`) - requests its own neighbor
+        # list at its own cutoff, unrelated to what PET itself predicts, and
+        # picking that one up here (as a naive "widest of everything requested"
+        # or "last requested" would) pads targets to a cutoff PET's own
+        # predictions don't reach - the same failure mode as not padding wide
+        # enough, just from the opposite direction.
+        own_neighbor_lists = get_own_requested_neighbor_lists(requested_neighbor_lists)
+        nl_options = max(own_neighbor_lists, key=lambda nl: nl.cutoff)
         max_atoms = self.hypers["max_atoms_per_batch"]
         atomic_basis_transform, atomic_basis_reverse_transform = (
             get_prepare_atomic_basis_targets_transform(

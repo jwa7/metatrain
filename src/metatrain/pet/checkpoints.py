@@ -433,6 +433,22 @@ def model_update_v17_v18(checkpoint: dict) -> None:
                 spec.setdefault("conditioned_on", "center")
 
 
+def model_update_v18_v19(checkpoint: dict) -> None:
+    """
+    Update a v18 checkpoint to v19.
+
+    Backfills ``cutoff_matrix_edges`` (``None``, i.e. disabled), the outer-cutoff
+    node-product route for atom-pair targets introduced on this version. The
+    ``state_dict`` is unchanged: with it disabled, no outer-cutoff modules
+    (``outer_edge_heads``/``outer_last_layers``) are created in the first place.
+
+    :param checkpoint: The checkpoint to update.
+    """
+    hypers = checkpoint["model_data"]["model_hypers"]
+    if "cutoff_matrix_edges" not in hypers:
+        hypers["cutoff_matrix_edges"] = None
+
+
 ###########################
 # TRAINER #################
 ###########################

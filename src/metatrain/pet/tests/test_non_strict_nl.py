@@ -162,6 +162,9 @@ def test_non_strict_nl_does_not_inflate_nef_tensors():
                 cell_shifts,
                 system_indices,
                 model.cutoff_width_adaptive,
+                torch.empty(0, dtype=centers.dtype),
+                torch.empty(0, dtype=neighbors.dtype),
+                torch.empty((0, 3), dtype=cell_shifts.dtype),
             )
         )
     strict_data, non_strict_data = batch_data

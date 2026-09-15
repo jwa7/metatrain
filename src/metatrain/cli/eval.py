@@ -42,6 +42,7 @@ from metatrain.utils.io import load_model
 from metatrain.utils.logging import MetricLogger
 from metatrain.utils.metrics import MAEAccumulator, RMSEAccumulator
 from metatrain.utils.neighbor_lists import (
+    get_own_requested_neighbor_lists,
     get_requested_neighbor_lists,
     get_system_with_neighbor_lists_transform,
 )
@@ -212,11 +213,30 @@ def _eval_targets(
         k: v for k, v in options.items() if isinstance(v, TargetInfo)
     }
     if any(info.is_atomic_basis for info in target_info_dict.values()):
+        # Pad atom-pair (edge) targets generously enough for whatever the model
+        # can actually predict: some architectures (e.g. PET with an outer cutoff
+        # configured) request more than one neighbor list, and the *largest* one
+        # is the one that determines how far out the model's own atom-pair
+        # predictions reach - padding to a smaller one would leave predictions
+        # the target's own sample grid was never built to include, and the
+        # prediction/target tensors would come out different sizes downstream.
+        # Padding to a larger-than-necessary cutoff is harmless: the extra
+        # candidate samples simply stay at their fill value, unmatched.
+        #
+        # This must only consider neighbor lists requested by the model itself
+        # (`get_own_requested_neighbor_lists`), not by a submodule: an additive
+        # baseline (e.g. an `EdgeCompositionModel`) can request its own neighbor
+        # list at its own cutoff, unrelated to what the model itself predicts -
+        # picking that one up here would pad targets to a cutoff the model's own
+        # predictions don't reach, the same failure mode from the opposite
+        # direction.
+        own_neighbor_lists = get_own_requested_neighbor_lists(requested_neighbor_lists)
+        widest_nl_options = max(own_neighbor_lists, key=lambda nl: nl.cutoff)
         atomic_basis_transform, atomic_basis_reverse_transform = (
             get_prepare_atomic_basis_targets_transform(
                 target_info_dict,
                 {},
-                nl_options=requested_neighbor_lists[0],
+                nl_options=widest_nl_options,
             )
         )
         callables += [atomic_basis_transform, atomic_basis_reverse_transform]

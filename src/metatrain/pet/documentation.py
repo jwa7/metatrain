@@ -163,6 +163,28 @@ class ModelHypers(TypedDict):
     between atoms is expected to be negligible. A lower cutoff will lead
     to faster models.
     """
+    cutoff_matrix_edges: Optional[float] = None
+    """Outer cutoff for atom-pair (edge) targets, extending their reach beyond
+    :attr:`cutoff` cheaply. Must be greater than :attr:`cutoff` if set.
+
+    A pair within :attr:`cutoff` is predicted as usual, from the edge features
+    that come through the GNN's neighborhood attention. A pair beyond
+    :attr:`cutoff` but within ``cutoff_matrix_edges`` has no such edge feature -
+    it was never part of the attention graph - so it is instead predicted
+    cheaply: a single MLP applied to the two atoms' own (already-computed) node
+    features together with an embedding of the pair's own geometry, with no
+    additional attention or message passing.
+
+    Both routes are smoothly weighted with distance (reusing
+    :attr:`cutoff_function`/:attr:`cutoff_width`), so a pair's total prediction
+    has no discontinuity crossing :attr:`cutoff` - handing off smoothly from the
+    attention route to the node-product route - and vanishes smoothly at
+    ``cutoff_matrix_edges`` rather than being truncated.
+
+    ``None`` (the default) disables this: atom-pair targets are predicted only
+    from the inner, attention-based edge features, exactly as before, and no
+    outer neighbor list is requested.
+    """
     num_neighbors_adaptive: Optional[int] = None
     """Target number of neighbors for the adaptive cutoff scheme.
 

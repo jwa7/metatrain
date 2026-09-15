@@ -112,6 +112,46 @@ def concatenate_structures(
     )
 
 
+def compute_flat_edge_vectors(
+    positions: torch.Tensor,
+    centers: torch.Tensor,
+    neighbors: torch.Tensor,
+    cells: torch.Tensor,
+    cell_shifts: torch.Tensor,
+    system_indices: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Cartesian edge vectors and distances for a flat (non-NEF) list of edges, e.g.
+    from a second, independently-cutoffed neighbor list that doesn't need the rest
+    of the NEF-specific machinery in :func:`compute_batch_tensors` (padding,
+    adaptive cutoffs, ...). This is the same formula as the start of that function -
+    duplicated rather than factored out of it, to avoid touching its already-verified
+    behaviour.
+
+    :param positions: Concatenated atomic positions, shape ``(num_nodes, 3)``.
+    :param centers: Flat center atom global indices for each edge, shape
+        ``(n_edges,)``.
+    :param neighbors: Flat neighbor atom global indices for each edge, shape
+        ``(n_edges,)``.
+    :param cells: Stacked cell tensors, shape ``(num_systems, 3, 3)``.
+    :param cell_shifts: Integer cell shift vectors per edge, shape ``(n_edges, 3)``.
+    :param system_indices: System index for each atom, shape ``(num_nodes,)``.
+    :return: Tuple of edge vectors, shape ``(n_edges, 3)``, and edge distances, shape
+        ``(n_edges,)``.
+    """
+    if len(cells) == 1:
+        cell_contributions = cell_shifts.to(cells.dtype) @ cells[0]
+    else:
+        cell_contributions = torch.einsum(
+            "ab, abc -> ac",
+            cell_shifts.to(cells.dtype),
+            cells[system_indices[centers]],
+        )
+    edge_vectors = positions[neighbors] - positions[centers] + cell_contributions
+    edge_distances = torch.norm(edge_vectors, dim=-1) + 1e-15
+    return edge_vectors, edge_distances
+
+
 def compute_batch_tensors(
     positions: torch.Tensor,
     centers: torch.Tensor,

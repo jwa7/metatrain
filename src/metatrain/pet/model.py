@@ -66,7 +66,7 @@ class PET(ModelInterface[ModelHypers]):
         targets.
     """
 
-    __checkpoint_version__ = 18
+    __checkpoint_version__ = 19
     __supported_devices__ = ["cuda", "cpu"]
     __supported_dtypes__ = [torch.float32, torch.float64]
     __default_metadata__ = ModelMetadata(
@@ -99,6 +99,29 @@ class PET(ModelInterface[ModelHypers]):
         nl_is_strict = bool(self.hypers["long_range"]["enable"])
         self.requested_nl = NeighborListOptions(
             cutoff=self.cutoff,
+            full_list=True,
+            strict=nl_is_strict,
+        )
+        # Outer cutoff for atom-pair (edge) targets - see
+        # ``PETBackend.compute_outer_atomic_predictions``. Mirrors the backend's own
+        # ``has_outer_cutoff``/``cutoff_matrix_edges`` (kept as a plain ``float``,
+        # defaulting to ``cutoff`` itself when disabled, rather than
+        # ``Optional[float]``, so TorchScript doesn't need to reason about a
+        # possibly-``None`` attribute) - validated once, here, rather than in both
+        # places.
+        cutoff_matrix_edges = self.hypers["cutoff_matrix_edges"]
+        self.has_outer_cutoff = cutoff_matrix_edges is not None
+        if self.has_outer_cutoff:
+            if cutoff_matrix_edges <= self.cutoff:
+                raise ValueError(
+                    f"cutoff_matrix_edges ({cutoff_matrix_edges}) must be greater "
+                    f"than cutoff ({self.cutoff})."
+                )
+            self.cutoff_matrix_edges = float(cutoff_matrix_edges)
+        else:
+            self.cutoff_matrix_edges = self.cutoff
+        self.requested_nl_outer = NeighborListOptions(
+            cutoff=self.cutoff_matrix_edges,
             full_list=True,
             strict=nl_is_strict,
         )
@@ -300,6 +323,8 @@ class PET(ModelInterface[ModelHypers]):
         return self
 
     def requested_neighbor_lists(self) -> List[NeighborListOptions]:
+        if self.has_outer_cutoff:
+            return [self.requested_nl, self.requested_nl_outer]
         return [self.requested_nl]
 
     def requested_inputs(self) -> Dict[str, ModelOutput]:
@@ -448,6 +473,31 @@ class PET(ModelInterface[ModelHypers]):
                 sample_labels,
             ) = concatenate_structures(systems, nl_options)
 
+        # Outer-cutoff edges for atom-pair targets' node-product route (see
+        # ``PETBackend.compute_outer_atomic_predictions``) - a second, independently-
+        # cutoffed neighbor list read the same way as the inner one above. Only
+        # ``centers``/``neighbors``/``cell_shifts`` actually differ between the two;
+        # everything else (``positions``/``species``/``cells``/``system_indices``/
+        # ``sample_labels``) describes atoms, not edges, and is identical.
+        if self.has_outer_cutoff:
+            with torch.profiler.record_function("PET::concatenate_structures_outer"):
+                (
+                    _,
+                    centers_outer,
+                    neighbors_outer,
+                    _,
+                    _,
+                    cell_shifts_outer,
+                    _,
+                    _,
+                ) = concatenate_structures(systems, self.requested_nl_outer)
+        else:
+            centers_outer = torch.empty(0, dtype=centers.dtype, device=device)
+            neighbors_outer = torch.empty(0, dtype=neighbors.dtype, device=device)
+            cell_shifts_outer = torch.empty(
+                (0, 3), dtype=cell_shifts.dtype, device=device
+            )
+
         with torch.profiler.record_function("PET::backend::preprocess"):
             batch_data = self.backend.preprocess(
                 positions,
@@ -458,6 +508,9 @@ class PET(ModelInterface[ModelHypers]):
                 cell_shifts,
                 system_indices,
                 self.cutoff_width_adaptive,
+                centers_outer,
+                neighbors_outer,
+                cell_shifts_outer,
             )
 
         # ===== BEGIN DIAGNOSTIC-RELATED BLOCK
@@ -565,6 +618,7 @@ class PET(ModelInterface[ModelHypers]):
                 atomic_predictions,
                 node_last_layer_features_dict,
                 edge_last_layer_features_dict,
+                outer_atomic_predictions,
             ) = self.backend.predict(
                 node_features_list,
                 edge_features_list,
@@ -575,6 +629,7 @@ class PET(ModelInterface[ModelHypers]):
             )
 
             pair_sample_labels: Optional[Labels] = None
+            pair_sample_labels_outer: Optional[Labels] = None
             if len(atom_pair_output_names) > 0:
                 pair_sample_labels = get_pair_sample_labels(
                     sample_labels,
@@ -582,6 +637,13 @@ class PET(ModelInterface[ModelHypers]):
                     batch_data["neighbors"],
                     batch_data["cell_shifts"],
                 )
+                if self.has_outer_cutoff:
+                    pair_sample_labels_outer = get_pair_sample_labels(
+                        sample_labels,
+                        batch_data["centers_outer"],
+                        batch_data["neighbors_outer"],
+                        batch_data["cell_shifts_outer"],
+                    )
 
         # **Stage 2: Intermediate Feature Output (Optional)**
         with torch.profiler.record_function("PET::_get_output_features"):
@@ -621,6 +683,8 @@ class PET(ModelInterface[ModelHypers]):
                 pair_sample_labels,
                 outputs,
                 selected_atoms,
+                outer_atomic_predictions,
+                pair_sample_labels_outer,
             )
 
             for k, v in atomic_predictions_dict.items():
@@ -988,6 +1052,8 @@ class PET(ModelInterface[ModelHypers]):
         pair_sample_labels: Optional[Labels],
         outputs: Dict[str, ModelOutput],
         selected_atoms: Optional[Labels],
+        outer_atomic_predictions: Dict[str, List[torch.Tensor]],
+        pair_sample_labels_outer: Optional[Labels],
     ) -> Dict[str, TensorMap]:
         """
         Wrap the per-block atomic predictions computed by the backend into TensorMaps.
@@ -1005,6 +1071,15 @@ class PET(ModelInterface[ModelHypers]):
             requested output has ``sample_kind == "atom_pair"``.
         :param outputs: Dictionary of requested outputs.
         :param selected_atoms: Optional Labels specifying a subset of atoms to include.
+        :param outer_atomic_predictions: Outer-cutoff ("node-product") contributions
+            for atom-pair outputs that have one configured (see
+            :meth:`PETBackend.compute_outer_atomic_predictions`), keyed by output
+            name; absent for outputs without an outer route. Each value is a list of
+            per-block flat prediction tensors, one row per *outer*-cutoff edge - a
+            different, generally larger sample set than ``pair_sample_labels``' own.
+        :param pair_sample_labels_outer: Labels for the outer-cutoff edges, same
+            column convention as ``pair_sample_labels``. Required (non-``None``) if
+            ``outer_atomic_predictions`` is non-empty.
         :return: Dictionary mapping requested output names to TensorMaps of
             predictions: per-atom, per-atom-pair, or summed over atoms.
         """
@@ -1038,6 +1113,40 @@ class PET(ModelInterface[ModelHypers]):
                     keys=self.key_labels[output_name],
                     blocks=blocks,
                 )
+
+                # Outer-cutoff node-product route, only for atom-pair outputs that
+                # have one configured: build its own TensorMap over its own (outer)
+                # edges, then add it - sample by sample, padding either side with
+                # 0.0 where the other has no entry - onto the inner TensorMap above,
+                # since the two generally cover different edges.
+                if output_name in outer_atomic_predictions:
+                    assert pair_sample_labels_outer is not None
+                    outer_prediction_blocks = outer_atomic_predictions[output_name]
+                    outer_blocks: List[TensorBlock] = []
+                    outer_block_index = 0
+                    for shape, components, properties in zip(
+                        self.output_shapes[output_name].values(),
+                        self.component_labels[output_name],
+                        self.property_labels[output_name],
+                        strict=True,
+                    ):
+                        outer_blocks.append(
+                            TensorBlock(
+                                values=outer_prediction_blocks[
+                                    outer_block_index
+                                ].reshape([-1] + shape),
+                                samples=pair_sample_labels_outer,
+                                components=components,
+                                properties=properties,
+                            )
+                        )
+                        outer_block_index += 1
+                    outer_tmap = TensorMap(
+                        keys=self.key_labels[output_name], blocks=outer_blocks
+                    )
+                    atomic_predictions_tmap_dict[output_name] = add_atom_pair_tensormaps(
+                        atomic_predictions_tmap_dict[output_name], outer_tmap
+                    )
         # If selected atoms request is provided, we slice the atomic predictions
         # tensor maps to get the predictions for the selected atoms only.
 
@@ -1319,6 +1428,75 @@ def _extract_charge_spin_multiplicity(
                 )
             spin_multiplicities[i] = raw_spin_multiplicity.long().squeeze()
     return charges, spin_multiplicities
+
+
+def _pad_atom_pair_block_samples(block: TensorBlock, full_samples: Labels) -> TensorBlock:
+    """
+    Pad ``block`` with 0.0-valued rows for every sample in ``full_samples`` it
+    doesn't already have (``full_samples`` must be a superset of ``block``'s own
+    samples). A TorchScript-safe, ``add_atom_pair_tensormaps``-specific stand-in for
+    ``atomic_basis_helpers._pad_block``'s "samples" branch, which builds its padded
+    shape via ``(len(samples), *[len(c) for c in block.components], len(properties))``
+    - a starred-unpacking ``torch.full`` shape argument TorchScript cannot compile.
+    That branch is otherwise only ever reached from eager-mode training-time
+    transforms, so this is the first TorchScript-scripted call graph to exercise it -
+    hence a local, minimal workaround here rather than a fix to the shared function,
+    which has wider (untested, in a scripted context) blast radius.
+
+    :param block: The block to pad.
+    :param full_samples: The full (padded) sample set - a superset of ``block``'s own.
+    :return: A new block with ``full_samples`` as its samples, 0.0 for every added
+        row.
+    """
+    new_shape = list(block.values.shape)
+    new_shape[0] = len(full_samples)
+    new_values = torch.zeros(
+        new_shape, dtype=block.values.dtype, device=block.values.device
+    )
+    intersection = full_samples.intersection(block.samples)
+    idxs_padded = full_samples.select(intersection)
+    idxs_original = block.samples.select(intersection)
+    new_values[idxs_padded] = block.values[idxs_original]
+    return TensorBlock(
+        values=new_values,
+        samples=full_samples,
+        components=block.components,
+        properties=block.properties,
+    )
+
+
+def add_atom_pair_tensormaps(a: TensorMap, b: TensorMap) -> TensorMap:
+    """
+    Add two atom-pair TensorMaps sample-by-sample, even when they don't cover the
+    same samples - e.g. the inner (attention-based) and outer (node-product)
+    contributions to the same atom-pair target, which come from two different,
+    independently-cutoffed neighbor lists and therefore generally have different
+    edges. Each block is padded with 0.0 onto the union of the two sides' samples
+    before adding, so a sample present on only one side contributes its own value
+    unchanged, rather than being dropped.
+
+    Assumes ``a`` and ``b`` share the same keys, and that same-key blocks share the
+    same components/properties (only their samples may differ) - true here, since
+    both are always built from the same target's own ``key_labels``/
+    ``component_labels``/``property_labels``.
+
+    :param a: First atom-pair TensorMap.
+    :param b: Second atom-pair TensorMap, to add to ``a``.
+    :return: The sample-wise sum, over the union of ``a``'s and ``b``'s samples.
+    """
+    new_blocks: List[TensorBlock] = []
+    for key, block_a in a.items():
+        block_b = b.block(key)
+        full_samples_values = torch.concatenate(
+            [block_a.samples.values, block_b.samples.values]
+        )
+        full_samples = Labels(
+            block_a.samples.names, torch.unique(full_samples_values, dim=0)
+        )
+        padded_a = _pad_atom_pair_block_samples(block_a, full_samples)
+        padded_b = _pad_atom_pair_block_samples(block_b, full_samples)
+        new_blocks.append(_add_block_block(padded_a, padded_b))
+    return TensorMap(keys=a.keys, blocks=new_blocks)
 
 
 def get_last_layer_features_name(target_name: str) -> str:
