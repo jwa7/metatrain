@@ -14,6 +14,7 @@ import torch
 from metatomic.torch import ModelOutput, System, register_autograd_neighbors
 
 from metatrain.pet import PET
+from metatrain.pet.model import add_atom_pair_tensormaps
 from metatrain.pet.modules.structures import concatenate_structures
 from metatrain.utils.data import DatasetInfo
 from metatrain.utils.data.target_info import get_energy_target_info
@@ -308,3 +309,79 @@ def test_backend_torch_compile(fullgraph):
     torch.testing.assert_close(energy_backend, energy_full)
     torch.testing.assert_close(forces_backend, forces_full)
     torch.testing.assert_close(strain_grad_backend, strain_grad_full)
+
+
+def test_add_atom_pair_tensormaps_preserves_target_sample_order():
+    """The merged inner+outer prediction must keep the outer route's own sample
+    order, which is the neighbor-list order the atom-pair target's padded sample
+    grid is built in.
+
+    The loss flattens prediction and target blocks and compares them by row
+    position, without aligning samples, so any reordering here silently scores
+    each edge against a different edge's target. Building the merged sample set
+    with ``torch.unique`` sorts the rows and does exactly that, while leaving the
+    row *count* correct, so nothing raises.
+    """
+    names = [
+        "system",
+        "first_atom",
+        "second_atom",
+        "cell_shift_a",
+        "cell_shift_b",
+        "cell_shift_c",
+    ]
+    # Deliberately not in sorted order: a real neighbor list emits each center's
+    # neighbors in bin-traversal order, not by ascending index.
+    outer_samples = mts.Labels(
+        names,
+        torch.tensor(
+            [
+                [0, 0, 4, 0, 0, 0],
+                [0, 0, 1, 0, 0, 0],
+                [0, 0, 3, 0, 0, 0],
+                [0, 1, 2, 0, 0, 0],
+            ]
+        ),
+    )
+    # The inner route covers a subset of those edges (smaller cutoff).
+    inner_samples = mts.Labels(
+        names,
+        torch.tensor([[0, 0, 1, 0, 0, 0], [0, 1, 2, 0, 0, 0]]),
+    )
+    keys = mts.Labels("_", torch.tensor([[0]]))
+    properties = mts.Labels("p", torch.tensor([[0]]))
+
+    inner = mts.TensorMap(
+        keys,
+        [
+            mts.TensorBlock(
+                values=torch.tensor([[10.0], [20.0]]),
+                samples=inner_samples,
+                components=[],
+                properties=properties,
+            )
+        ],
+    )
+    outer = mts.TensorMap(
+        keys,
+        [
+            mts.TensorBlock(
+                values=torch.tensor([[1.0], [2.0], [3.0], [4.0]]),
+                samples=outer_samples,
+                components=[],
+                properties=properties,
+            )
+        ],
+    )
+
+    merged = add_atom_pair_tensormaps(inner, outer)
+    block = merged.block()
+
+    # Order, not just membership: this is what the positional loss depends on.
+    assert torch.equal(block.samples.values, outer_samples.values)
+
+    # And each inner contribution landed on its own edge, by label:
+    #   (0,0,4) outer only; (0,0,1) 2 + 10; (0,0,3) outer only; (0,1,2) 4 + 20
+    assert torch.allclose(
+        block.values, torch.tensor([[1.0], [12.0], [3.0], [24.0]])
+    )

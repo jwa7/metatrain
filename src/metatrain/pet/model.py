@@ -1480,6 +1480,14 @@ def add_atom_pair_tensormaps(a: TensorMap, b: TensorMap) -> TensorMap:
     both are always built from the same target's own ``key_labels``/
     ``component_labels``/``property_labels``.
 
+    Also assumes ``b``'s samples are a superset of ``a``'s, and are in the row order
+    the atom-pair target's own padded sample grid uses - true here, since ``b`` is
+    the outer route, whose neighbor list has a strictly larger cutoff than ``a``'s
+    and which is labelled by the same ``get_pair_sample_labels`` call as that grid.
+    The result is returned on ``b``'s samples, in that same order, which the loss
+    relies on: it compares prediction and target blocks by row position without
+    aligning samples.
+
     :param a: First atom-pair TensorMap.
     :param b: Second atom-pair TensorMap, to add to ``a``.
     :return: The sample-wise sum, over the union of ``a``'s and ``b``'s samples.
@@ -1487,15 +1495,24 @@ def add_atom_pair_tensormaps(a: TensorMap, b: TensorMap) -> TensorMap:
     new_blocks: List[TensorBlock] = []
     for key, block_a in a.items():
         block_b = b.block(key)
-        full_samples_values = torch.concatenate(
-            [block_a.samples.values, block_b.samples.values]
-        )
-        full_samples = Labels(
-            block_a.samples.names, torch.unique(full_samples_values, dim=0)
-        )
+        # ``b``'s samples are used as the merged sample set directly, rather than
+        # a union built here. ``b`` (the outer, node-product route) comes from a
+        # neighbor list at a strictly larger cutoff than ``a`` (the inner,
+        # attention route), so its samples are already a superset of ``a``'s; and
+        # both it and the atom-pair target's own padded sample grid are built by
+        # the same ``get_pair_sample_labels`` call, so they share the neighbor
+        # list's own row order.
+        #
+        # Do NOT rebuild the union with ``torch.unique(..., dim=0)``: that returns
+        # its rows lexicographically sorted, which permutes the prediction
+        # relative to the target grid. The union has the same length as that grid
+        # (``a``'s samples being a subset of ``b``'s), so nothing raises - but the
+        # loss flattens prediction and target blocks and compares them by row
+        # position, without aligning samples, and therefore scores each edge
+        # against a different edge's target.
+        full_samples = block_b.samples
         padded_a = _pad_atom_pair_block_samples(block_a, full_samples)
-        padded_b = _pad_atom_pair_block_samples(block_b, full_samples)
-        new_blocks.append(_add_block_block(padded_a, padded_b))
+        new_blocks.append(_add_block_block(padded_a, block_b))
     return TensorMap(keys=a.keys, blocks=new_blocks)
 
 
