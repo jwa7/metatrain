@@ -108,11 +108,15 @@ def match_layout(
     # Check that both tensormaps are either spherical or not.
     # If they are spherical, check if they are coupled or uncoupled
     # and modify tmap1 to match tmap2.
+    # A spherical TensorMap is one that *has* an ``o3_lambda`` key dimension
+    # (``o3_lambda_1`` when coupled). Testing for its absence would mark scalar
+    # targets such as ``energy`` as spherical, sending them into the
+    # coupling branch below, which then fails for want of CG coefficients.
     tmap1_is_spherical = (
-        "o3_lambda" not in tmap1.keys.names and "o3_lambda_1" not in tmap1.keys.names
+        "o3_lambda" in tmap1.keys.names or "o3_lambda_1" in tmap1.keys.names
     )
     tmap2_is_spherical = (
-        "o3_lambda" not in tmap2.keys.names and "o3_lambda_1" not in tmap2.keys.names
+        "o3_lambda" in tmap2.keys.names or "o3_lambda_1" in tmap2.keys.names
     )
     if tmap1_is_spherical != tmap2_is_spherical:
         raise ValueError(
