@@ -108,10 +108,6 @@ def match_layout(
     # Check that both tensormaps are either spherical or not.
     # If they are spherical, check if they are coupled or uncoupled
     # and modify tmap1 to match tmap2.
-    # A spherical TensorMap is one that *has* an ``o3_lambda`` key dimension
-    # (``o3_lambda_1`` when coupled). Testing for its absence would mark scalar
-    # targets such as ``energy`` as spherical, sending them into the
-    # coupling branch below, which then fails for want of CG coefficients.
     tmap1_is_spherical = (
         "o3_lambda" in tmap1.keys.names or "o3_lambda_1" in tmap1.keys.names
     )
@@ -126,14 +122,15 @@ def match_layout(
     elif tmap1_is_spherical:
         tmap1_is_coupled = "o3_lambda_1" in tmap1.keys.names
         tmap2_is_coupled = "o3_lambda_1" in tmap2.keys.names
-        if cg_coeffs is None:
-            raise ValueError(
-                "Cannot couple or uncouple spherical tensor blocks without "
-                "Clebsch-Gordan coefficients."
-            )
-        if tmap1_is_coupled and not tmap2_is_coupled:
-            tmap1 = uncouple_tensor_blocks(tmap1, cg_coeffs)
-        elif not tmap1_is_coupled and tmap2_is_coupled:
-            tmap1 = couple_tensor_blocks(tmap1, cg_coeffs)
+        if tmap1_is_coupled != tmap2_is_coupled:
+            if cg_coeffs is None:
+                raise ValueError(
+                    "Cannot couple or uncouple spherical tensor blocks without "
+                    "Clebsch-Gordan coefficients."
+                )
+            if tmap1_is_coupled:
+                tmap1 = uncouple_tensor_blocks(tmap1, cg_coeffs)
+            else:
+                tmap1 = couple_tensor_blocks(tmap1, cg_coeffs)
 
     return tmap1
