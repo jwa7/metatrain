@@ -8,6 +8,7 @@ from omegaconf import OmegaConf
 from typing_extensions import TypedDict
 
 from metatrain.utils.hypers import (
+    get_hypers_diff,
     get_hypers_list,
     init_with_defaults,
     overwrite_defaults,
@@ -148,3 +149,32 @@ def test_per_atom_deprecation(per_atom: bool, mode: str, tmp_path: Path):
         )
     elif mode == "eval":
         assert options.targets["mtt::some_target"].sample_kind == sample_kind
+
+
+def test_get_hypers_diff_key_missing_from_old_hypers():
+    """A hyper added after a checkpoint was written falls back to its default.
+
+    Restarting from such a checkpoint used to raise `KeyError` on the new key.
+    """
+    old_hypers = {"cutoff": 5.0}
+    new_hypers = {"cutoff": 5.0, "use_onsite_scales_for_offsite": False}
+    default_hypers = {"cutoff": 5.0, "use_onsite_scales_for_offsite": False}
+
+    assert get_hypers_diff(old_hypers, new_hypers, default_hypers=default_hypers) == {}
+
+
+def test_get_hypers_diff_missing_key_differing_from_default_is_a_mismatch():
+    """Turning a new hyper on against an old checkpoint is still reported."""
+    old_hypers = {"cutoff": 5.0}
+    new_hypers = {"cutoff": 5.0, "use_onsite_scales_for_offsite": True}
+    default_hypers = {"cutoff": 5.0, "use_onsite_scales_for_offsite": False}
+
+    diff = get_hypers_diff(old_hypers, new_hypers, default_hypers=default_hypers)
+    assert diff == {"use_onsite_scales_for_offsite": (False, True)}
+
+
+def test_get_hypers_diff_missing_key_without_default_is_skipped():
+    old_hypers = {"cutoff": 5.0}
+    new_hypers = {"cutoff": 5.0, "brand_new": 3}
+
+    assert get_hypers_diff(old_hypers, new_hypers) == {}

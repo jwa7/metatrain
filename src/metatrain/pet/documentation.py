@@ -358,6 +358,16 @@ class ModelHypers(TypedDict):
           mtt::foo:
             atom_type_gating: one-hot
     """
+    use_onsite_scales_for_offsite: bool = False
+    """Use onsite (node) scales as a proxy for offsite (edge) scales.
+
+    Forwarded to the scaler, which owns the behaviour. See
+    :attr:`metatrain.scaler.ModelHypers.use_onsite_scales_for_offsite`.
+    Only has an effect when ``scale_targets`` is ``True``."""
+    offsite_proxy_mean: Literal["geometric", "arithmetic"] = "geometric"
+    """Aggregation for the onsite-scale proxy, ``"geometric"`` or
+    ``"arithmetic"``. Only used when ``use_onsite_scales_for_offsite`` is
+    ``True``."""
     zbl: bool = False
     """Use ZBL potential for short-range repulsion"""
     edge_composition: Optional[str] = None

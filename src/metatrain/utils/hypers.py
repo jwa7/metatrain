@@ -144,8 +144,10 @@ def get_hypers_diff(
         to fill the missing keys in values of the new hypers that are dicts.
 
     :return: A dict with the hyperparameters that are different in the new
-        hypers compared to the old hypers. It is assumed that every key in
-        the new hypers is also present in the old hypers.
+        hypers compared to the old hypers. A key missing from the old hypers is
+        compared against its default instead, since a checkpoint written before
+        that hyper existed ran with the default; if no default is available the
+        key is skipped.
     """
 
     if default_hypers is not None:
@@ -158,7 +160,12 @@ def get_hypers_diff(
 
     diff = {}
     for key, new_value in new_hypers.items():
-        old_value = old_hypers[key]
+        if key in old_hypers:
+            old_value = old_hypers[key]
+        elif default_hypers is not None and key in default_hypers:
+            old_value = default_hypers[key]
+        else:
+            continue
         if old_value != new_value:
             diff[key] = (old_value, new_value)
     return diff

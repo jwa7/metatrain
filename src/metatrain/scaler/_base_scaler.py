@@ -897,14 +897,28 @@ class BaseScaler(torch.nn.Module):
         self,
         node_target_name: str,
         edge_target_name: str,
+        mean: str = "geometric",
     ) -> None:
         """
         Computes the per-target scales of an atom-pair (edge) target from the per-target
         scales of the corresponding per-atom (node) target.
 
         For each pair of atomic types (Z_I, Z_J), the per-target scale of the edge
-        target is set to the geometric mean of the per-target scales of the node target
-        for Z_I and Z_J.
+        target is set to a mean of the per-target scales of the node target for Z_I
+        and Z_J: ``sqrt(s_I * s_J)`` for ``mean="geometric"``, or
+        ``(s_I + s_J) / 2`` for ``mean="arithmetic"``. The geometric mean is the
+        AM-GM lower bound, so it yields smaller proxy scales and therefore a higher
+        relative weight on the edge target in the loss.
+
+        The node block supplying each of ``s_I`` and ``s_J`` is matched to the edge
+        block by its physics keys. For a coupled target (``o3_lambda``/``o3_sigma``
+        keys) the invariant node block is used. For an uncoupled target (paired
+        ``*_1``/``*_2`` keys, e.g. ``o3_lambda_1``/``o3_lambda_2``) the diagonal node
+        blocks are used: ``(k_1=A, k_2=A)`` supplies Z_I and ``(k_1=B, k_2=B)``
+        supplies Z_J for an edge block with keys ``(k_1=A, k_2=B)``.
+
+        Atom types are carried by the sample labels as positional indices into
+        :py:attr:`atomic_types`, not as atomic numbers.
 
         Only per-target scales are computed for edge targets; per-property scales for
         atom-pair targets stay at their identity default (1.0) - see
@@ -914,7 +928,12 @@ class BaseScaler(torch.nn.Module):
 
         :param node_target_name: Name of the per-atom (node) target.
         :param edge_target_name: Name of the atom-pair (edge) target.
+        :param mean: Aggregation for the proxy, ``"geometric"`` or ``"arithmetic"``.
         """
+        if mean not in ("geometric", "arithmetic"):
+            raise ValueError(
+                f"offsite_proxy_mean must be 'geometric' or 'arithmetic', got '{mean}'"
+            )
         if node_target_name not in self.target_names:
             raise ValueError(f"Node target '{node_target_name}' not found in scaler.")
         if edge_target_name not in self.target_names:
@@ -925,43 +944,88 @@ class BaseScaler(torch.nn.Module):
         node_pt = self.per_target_scales[node_target_name]
         edge_pt = self.per_target_scales[edge_target_name]
         node_key_names: List[str] = list(node_pt.keys.names)
+        edge_key_names: List[str] = list(edge_pt.keys.names)
 
-        # For each atomic type (indexed by its position in `self.atomic_types`),
-        # look up the node target's scale (taking from the invariant block,
-        # though all blocks have the same value).
-        type_scale: Dict[int, torch.Tensor] = {}
-        for i_type, atomic_type in enumerate(self.atomic_types.tolist()):
-            node_key = [
-                atomic_type
-                if n == "atom_type"
-                else (0 if n == "o3_lambda" else 1 if n == "o3_sigma" else 0)
-                for n in node_key_names
-            ]
-            pos = node_pt.keys.position(node_key)
-            if pos is None:
-                logging.warning(
-                    "apply_onsite_scales_for_offsite: could not find the "
-                    f"invariant node block for atom type {atomic_type} in "
-                    f"target '{node_target_name}'; edge scales for pairs "
-                    "involving this type will be left unchanged."
-                )
-                continue
-            type_scale[i_type] = node_pt.block_by_id(pos).values[i_type, 0]
+        edge_phys_names: List[str] = []
+        for n in edge_key_names:
+            if not n.endswith("atom_type"):
+                edge_phys_names.append(n)
 
+        is_coupled = "o3_lambda" in edge_phys_names and "o3_sigma" in edge_phys_names
+
+        phys_1_names: List[str] = []
+        if not is_coupled:
+            for n in edge_phys_names:
+                if n.endswith("_1"):
+                    phys_1_names.append(n)
+
+        n_unmatched = 0
         new_blocks: List[TensorBlock] = []
         for edge_key in edge_pt.keys:
             edge_block = edge_pt.block(edge_key)
 
-            new_vals = edge_block.values.clone()
-            for row_idx, (first_index, second_index) in enumerate(
-                edge_block.samples.values.tolist()
-            ):
-                if first_index not in type_scale or second_index not in type_scale:
-                    continue  # leave this row unchanged (warning already logged)
+            edge_phys_vals: Dict[str, int] = {}
+            for n in edge_phys_names:
+                edge_phys_vals[n] = int(edge_key[n])
 
-                s_I = type_scale[first_index]
-                s_J = type_scale[second_index]
-                new_vals[row_idx, :] = torch.sqrt(s_I.abs() * s_J.abs())
+            node_vals_I: Dict[str, int] = {}
+            node_vals_J: Dict[str, int] = {}
+            if is_coupled:
+                for n in node_key_names:
+                    if n == "o3_lambda":
+                        node_vals_I[n] = 0
+                        node_vals_J[n] = 0
+                    elif n == "o3_sigma":
+                        node_vals_I[n] = 1
+                        node_vals_J[n] = 1
+                    elif n in edge_phys_vals:
+                        node_vals_I[n] = edge_phys_vals[n]
+                        node_vals_J[n] = edge_phys_vals[n]
+                    else:
+                        node_vals_I[n] = 0
+                        node_vals_J[n] = 0
+            else:
+                for n in edge_phys_names:
+                    node_vals_I[n] = edge_phys_vals[n]
+                    node_vals_J[n] = edge_phys_vals[n]
+                for n1 in phys_1_names:
+                    n2 = n1[:-2] + "_2"
+                    if n2 in edge_phys_vals:
+                        node_vals_I[n2] = edge_phys_vals[n1]
+                        node_vals_J[n1] = edge_phys_vals[n2]
+
+            node_key_I: List[int] = []
+            node_key_J: List[int] = []
+            for n in node_key_names:
+                if n in node_vals_I:
+                    node_key_I.append(node_vals_I[n])
+                else:
+                    node_key_I.append(0)
+                if n in node_vals_J:
+                    node_key_J.append(node_vals_J[n])
+                else:
+                    node_key_J.append(0)
+
+            pos_I = node_pt.keys.position(node_key_I)
+            pos_J = node_pt.keys.position(node_key_J)
+
+            new_vals = edge_block.values.clone()
+            if pos_I is None or pos_J is None:
+                n_unmatched += 1
+            else:
+                node_block_I = node_pt.block_by_id(pos_I)
+                node_block_J = node_pt.block_by_id(pos_J)
+                for row_idx, sample_row in enumerate(
+                    edge_block.samples.values.tolist()
+                ):
+                    first_index = int(sample_row[0])
+                    second_index = int(sample_row[1])
+                    s_I = node_block_I.values[first_index, 0]
+                    s_J = node_block_J.values[second_index, 0]
+                    if mean == "geometric":
+                        new_vals[row_idx, :] = torch.sqrt(s_I.abs() * s_J.abs())
+                    else:
+                        new_vals[row_idx, :] = (s_I.abs() + s_J.abs()) / 2
 
             new_blocks.append(
                 TensorBlock(
@@ -972,10 +1036,23 @@ class BaseScaler(torch.nn.Module):
                 )
             )
 
+        if n_unmatched > 0:
+            logging.warning(
+                "apply_onsite_scales_for_offsite: could not match a node block for "
+                f"{n_unmatched} of {len(edge_pt.keys)} blocks of "
+                f"'{edge_target_name}' against node target '{node_target_name}' "
+                f"(node keys {node_key_names}, edge keys {edge_key_names}); "
+                "those edge scales were left unchanged."
+            )
+        if n_unmatched == len(edge_pt.keys):
+            raise ValueError(
+                "apply_onsite_scales_for_offsite could not match any node block of "
+                f"'{node_target_name}' to the blocks of '{edge_target_name}'. The "
+                "offsite proxy would have no effect; refusing to continue silently."
+            )
+
         self.per_target_scales[edge_target_name] = TensorMap(edge_pt.keys, new_blocks)
 
-        # Recompute full scales = per_target * per_property (per_property scales
-        # for atom-pair targets are always 1.0, so this is really just a copy).
         current_pp = self.per_property_scales[edge_target_name]
         new_full_blocks: List[TensorBlock] = []
         for key in self.per_target_scales[edge_target_name].keys:

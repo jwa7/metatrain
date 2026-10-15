@@ -146,22 +146,26 @@ class Trainer(TrainerInterface[TrainerHypers]):
                 # Scaler.__init__), so incoming batches of (possibly sparse,
                 # atom_type-keyed) atomic-basis targets need to be densified the same
                 # way every other architecture densifies its own targets before
-                # training. Restricted to `model.target_infos`' keys (atom-pair
-                # targets are excluded there, see `Scaler.__init__`: padding them
-                # would require a neighbor list the scaler has no way to request, and
-                # their scales are never actually fit from this data anyway, see
-                # `BaseScaler.accumulate`) - but using the *layouts* from
+                # training. Atom-pair targets are skipped: padding them would
+                # require a neighbor list the scaler has no way to request, and their
+                # scales are never fit from this data anyway (see
+                # `BaseScaler.accumulate`). They can still be present in
+                # `model.target_infos` when the onsite-scale proxy is enabled, which
+                # sets them from the node scales - but using the *layouts* from
                 # `model.dataset_info.targets`, not `model.target_infos`: the latter
                 # are already densified (atom_type keys moved to samples, see
                 # `Scaler.__init__`), whereas the densify transform below needs a
                 # layout matching the raw, not-yet-densified incoming batch data
                 # (atom_type still a key dimension).
+                transform_targets = {}
+                for k, v in model.dataset_info.targets.items():
+                    if k not in model.target_infos:
+                        continue
+                    if v.sample_kind == "atom_pair":
+                        continue
+                    transform_targets[k] = v
                 atomic_basis_transform, _ = get_prepare_atomic_basis_targets_transform(
-                    {
-                        k: v
-                        for k, v in model.dataset_info.targets.items()
-                        if k in model.target_infos
-                    },
+                    transform_targets,
                     model.dataset_info.extra_data,
                 )
 
@@ -315,6 +319,42 @@ class Trainer(TrainerInterface[TrainerHypers]):
                     mts.save_buffer(
                         mts.make_contiguous(
                             model.model.per_property_scales[target_name].to(
+                                "cpu", torch.float64
+                            )
+                        )
+                    ).to(device),
+                )
+
+        if model.hypers.get("use_onsite_scales_for_offsite", False):
+            proxy_mean = model.hypers.get("offsite_proxy_mean", "geometric")
+            for edge_name in model.new_outputs:
+                if "::matrix_edges::" not in edge_name:
+                    continue
+                node_name = edge_name.replace("::matrix_edges::", "::matrix_nodes::")
+                if node_name not in model.model.target_names:
+                    continue
+                logging.info(
+                    f"Applying onsite-scale proxy ({proxy_mean} mean): "
+                    f"'{node_name}' -> '{edge_name}'"
+                )
+                model.model.apply_onsite_scales_for_offsite(
+                    node_name, edge_name, mean=proxy_mean
+                )
+            for target_name in model.model.scales.keys():
+                model.register_buffer(
+                    target_name + "_scaler_buffer",
+                    mts.save_buffer(
+                        mts.make_contiguous(
+                            model.model.scales[target_name].to("cpu", torch.float64)
+                        )
+                    ).to(device),
+                )
+            for target_name in model.model.per_target_scales.keys():
+                model.register_buffer(
+                    target_name + "_per_target_scaler_buffer",
+                    mts.save_buffer(
+                        mts.make_contiguous(
+                            model.model.per_target_scales[target_name].to(
                                 "cpu", torch.float64
                             )
                         )
